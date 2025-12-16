@@ -11,7 +11,7 @@ use commonware_cryptography::{
 };
 use commonware_deployer::ec2::Hosts;
 use commonware_p2p::{authenticated::discovery as authenticated, utils::requester, Manager};
-use commonware_runtime::{tokio, Metrics, Runner};
+use commonware_runtime::{tokio, Metrics, Runner, Spawner};
 use commonware_utils::{from_hex_formatted, quorum, set::Ordered, union_unique};
 use futures::future::try_join_all;
 use governor::Quota;
@@ -263,7 +263,7 @@ fn main() {
             fetch_rate_per_peer: resolver_limit,
             indexer,
         };
-        let engine = engine::Engine::new(context.with_label("engine"), engine_cfg).await;
+        let (engine, mempool, balances) = engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await;
 
         let marshal_resolver_cfg = marshal::resolver::p2p::Config {
             public_key: public_key.clone(),
@@ -285,8 +285,17 @@ fn main() {
         // Start engine
         let engine = engine.start(pending, recovered, resolver, broadcaster, marshal_resolver);
 
+        let api_port = config.metrics_port + 1000;
+        let api_mempool = mempool.clone();
+        let api_balances = balances.clone();
+        let api_handle = context.with_label("api").spawn(move |_| async move {
+            if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_balances, api_port).await {
+                error!(?e, "API server failed");
+            }
+        });
+
         // Wait for any task to error
-        if let Err(e) = try_join_all(vec![p2p, engine]).await {
+        if let Err(e) = try_join_all(vec![p2p, engine, api_handle]).await {
             error!(?e, "task failed");
         }
     });

@@ -106,12 +106,16 @@ impl<
     > Engine<E, B, I>
 {
     /// Create a new [Engine].
-    pub async fn new(context: E, cfg: Config<B, I>) -> Self {
+    pub async fn new_with_mempool(
+        context: E,
+        cfg: Config<B, I>,
+    ) -> (Self, application::Mempool, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>) {
         // Create the application
-        let (application, application_mailbox) = application::Actor::new(
+        let (application, application_mailbox, mempool, balances) = application::Actor::new(
             context.with_label("application"),
             application::Config {
                 mailbox_size: cfg.mailbox_size,
+                mempool_max_size: 1000,
             },
         );
 
@@ -203,18 +207,27 @@ impl<
             },
         );
 
-        // Return the engine
-        Self {
-            context: ContextCell::new(context),
+        // Return the engine, mempool, and balances
+        (
+            Self {
+                context: ContextCell::new(context),
 
-            application,
-            application_mailbox,
-            buffer,
-            buffer_mailbox,
-            marshal,
-            marshal_mailbox,
-            consensus,
-        }
+                application,
+                application_mailbox,
+                buffer,
+                buffer_mailbox,
+                marshal,
+                marshal_mailbox,
+                consensus,
+            },
+            mempool,
+            balances,
+        )
+    }
+
+    /// Create a new [Engine] (for backward compatibility).
+    pub async fn new(context: E, cfg: Config<B, I>) -> Self {
+        Self::new_with_mempool(context, cfg).await.0
     }
 
     /// Start the [simplex::Engine].

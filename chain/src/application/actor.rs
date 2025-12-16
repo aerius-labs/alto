@@ -1,5 +1,6 @@
 use super::{
     ingress::{Mailbox, Message},
+    mempool::Mempool,
     Config,
 };
 use crate::utils::OneshotClosedFut;
@@ -13,6 +14,7 @@ use futures::StreamExt;
 use futures::{channel::mpsc, future::try_join};
 use futures::{future, future::Either};
 use rand::Rng;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -22,24 +24,45 @@ const GENESIS: &[u8] = b"commonware is neat";
 /// Milliseconds in the future to allow for block timestamps.
 const SYNCHRONY_BOUND: u64 = 500;
 
+const GENESIS_BALANCE: u64 = 1000;
+
 /// Application actor.
 pub struct Actor<R: Rng + Spawner + Metrics + Clock> {
     context: ContextCell<R>,
     hasher: Sha256,
     mailbox: mpsc::Receiver<Message>,
+    balances: Arc<Mutex<HashMap<u64, u64>>>,
+    processed_heights: Arc<Mutex<HashSet<u64>>>,
+    mempool: Mempool,
 }
 
 impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
     /// Create a new application actor.
-    pub fn new(context: R, config: Config) -> (Self, Mailbox) {
+    pub fn new(context: R, config: Config) -> (Self, Mailbox, Mempool, Arc<Mutex<HashMap<u64, u64>>>) {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
+        
+        let mut balances = HashMap::new();
+        for i in 0..10 {
+            balances.insert(i, GENESIS_BALANCE);
+        }
+        
+        let mempool = Mempool::new(config.mempool_max_size);
+        let mempool_clone = mempool.clone();
+        let balances_arc = Arc::new(Mutex::new(balances));
+        let balances_clone = balances_arc.clone();
+        
         (
             Self {
                 context: ContextCell::new(context),
                 hasher: Sha256::new(),
                 mailbox,
+                balances: balances_clone,
+                processed_heights: Arc::new(Mutex::new(HashSet::new())),
+                mempool: mempool_clone,
             },
             Mailbox::new(sender),
+            mempool,
+            balances_arc,
         )
     }
 
@@ -52,7 +75,7 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
         // Compute genesis digest
         self.hasher.update(GENESIS);
         let genesis_parent = self.hasher.finalize();
-        let genesis = Block::new(genesis_parent, 0, 0);
+        let genesis = Block::new(genesis_parent, 0, 0, Vec::new());
         let genesis_digest = genesis.digest();
         let built: Option<(Round, Block)> = None;
         let built = Arc::new(Mutex::new(built));
@@ -81,6 +104,7 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
 
                     // Wait for the parent block to be available or the request to be cancelled in a separate task (to
                     // continue processing other messages)
+                    let mempool = self.mempool.clone();
                     self.context.with_label("propose").spawn({
                         let built = built.clone();
                         move |context| async move {
@@ -90,12 +114,18 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                                     // Get the parent block
                                     let parent = parent.unwrap();
 
-                                    // Create a new block
+                                    // Create a new block with transactions from mempool
                                     let mut current = context.current().epoch_millis();
                                     if current <= parent.timestamp {
                                         current = parent.timestamp + 1;
                                     }
-                                    let block = Block::new(parent.digest(), parent.height+1, current);
+                                    let transactions = mempool.take(10);
+                                    let block = Block::new(
+                                        parent.digest(),
+                                        parent.height + 1,
+                                        current,
+                                        transactions.clone(),
+                                    );
                                     let digest = block.digest();
                                     {
                                         let mut built = built.lock().unwrap();
@@ -104,7 +134,13 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
 
                                     // Send the digest to the consensus
                                     let result = response.send(digest);
-                                    info!(?round, ?digest, success=result.is_ok(), "proposed new block");
+                                    info!(
+                                        ?round,
+                                        ?digest,
+                                        tx_count = transactions.len(),
+                                        success=result.is_ok(),
+                                        "proposed new block"
+                                    );
                                 },
                                 _ = response_closed => {
                                     // The response was cancelled
@@ -151,6 +187,7 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                     // continue processing other messages)
                     self.context.with_label("verify").spawn({
                         let mut marshal = marshal.clone();
+                        let balances = self.balances.clone();
                         move |context| async move {
                             let requester =
                                 try_join(parent_request, marshal.subscribe(None, payload).await);
@@ -179,6 +216,12 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                                         return;
                                     }
 
+                                    if !Self::verify_transactions(&block, &balances) {
+                                        warn!(height = block.height, "transaction verification failed");
+                                        let _ = response.send(false);
+                                        return;
+                                    }
+
                                     // Persist the verified block
                                     marshal.verified(round, block).await;
 
@@ -194,16 +237,88 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                     });
                 }
                 Message::Finalized { block } => {
-                    // In an application that maintains state, you would compute the state transition function here.
-                    //
-                    // After an unclean shutdown, it is possible that the application may be asked to process a block it has already seen (which it can simply ignore).
+                    {
+                        let mut processed = self.processed_heights.lock().unwrap();
+                        if processed.contains(&block.height) {
+                            debug!(height = block.height, "block already processed, skipping");
+                            continue;
+                        }
+                        processed.insert(block.height);
+                    }
+
+                    self.execute_transactions(&block);
+
                     info!(
                         height = block.height,
                         digest = ?block.commitment(),
+                        tx_count = block.transactions.len(),
                         "processed finalized block"
                     );
                 }
             }
         }
+    }
+
+    fn verify_transactions(block: &Block, balances: &Arc<Mutex<HashMap<u64, u64>>>) -> bool {
+        let balances = balances.lock().unwrap();
+        let mut temp_balances = balances.clone();
+        
+        for tx in &block.transactions {
+            let sender_balance = temp_balances.get(&tx.from).copied().unwrap_or(0);
+            if sender_balance < tx.amount {
+                return false;
+            }
+            
+            if tx.amount == 0 {
+                return false;
+            }
+            
+            *temp_balances.entry(tx.from).or_insert(0) -= tx.amount;
+            *temp_balances.entry(tx.to).or_insert(0) += tx.amount;
+        }
+        
+        true
+    }
+
+    fn execute_transactions(&self, block: &Block) {
+        let mut balances = self.balances.lock().unwrap();
+        
+        for tx in &block.transactions {
+            let sender_balance = balances.get(&tx.from).copied().unwrap_or(0);
+            let receiver_balance = balances.get(&tx.to).copied().unwrap_or(0);
+            
+            if sender_balance >= tx.amount {
+                let new_sender_balance = sender_balance - tx.amount;
+                let new_receiver_balance = receiver_balance + tx.amount;
+                
+                *balances.entry(tx.from).or_insert(0) = new_sender_balance;
+                *balances.entry(tx.to).or_insert(0) = new_receiver_balance;
+                
+                info!(
+                    from = tx.from,
+                    to = tx.to,
+                    amount = tx.amount,
+                    from_balance_before = sender_balance,
+                    from_balance_after = new_sender_balance,
+                    to_balance_before = receiver_balance,
+                    to_balance_after = new_receiver_balance,
+                    "executed transfer"
+                );
+            } else {
+                warn!(
+                    from = tx.from,
+                    to = tx.to,
+                    amount = tx.amount,
+                    balance = sender_balance,
+                    "insufficient balance (should not happen after verification)"
+                );
+            }
+        }
+        
+        info!(
+            height = block.height,
+            total_accounts = balances.len(),
+            "state updated after block finalization"
+        );
     }
 }

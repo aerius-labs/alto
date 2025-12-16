@@ -3,6 +3,7 @@ use commonware_consensus::marshal::SchemeProvider;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+pub mod api;
 pub mod application;
 pub mod engine;
 pub mod indexer;

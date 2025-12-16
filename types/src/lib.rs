@@ -1,7 +1,7 @@
 //! Common types used throughout `alto`.
 
 mod block;
-pub use block::{Block, Finalized, Notarized};
+pub use block::{Block, Finalized, Notarized, Transaction};
 mod consensus;
 use commonware_utils::hex;
 pub use consensus::{
@@ -84,7 +84,7 @@ mod tests {
 
         // Create a block
         let digest = Sha256::hash(b"hello world");
-        let block = Block::new(digest, 10, 100);
+        let block = Block::new(digest, 10, 100, Vec::new());
         let proposal = Proposal::new(Round::new(EPOCH, 11), 8, block.digest());
 
         // Create a notarization
@@ -120,7 +120,7 @@ mod tests {
 
         // Create a block
         let digest = Sha256::hash(b"hello world");
-        let block = Block::new(digest, 10, 100);
+        let block = Block::new(digest, 10, 100, Vec::new());
         let proposal = Proposal::new(Round::new(EPOCH, 11), 8, block.digest());
 
         // Create a finalization
