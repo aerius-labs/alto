@@ -5,16 +5,15 @@ use clap::{Arg, Command};
 use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::marshal;
 use commonware_cryptography::{
-    bls12381::primitives::{group, poly, variant::MinSig},
+    bls12381::primitives::{group, sharing::Sharing, variant::MinSig},
     ed25519::{PrivateKey, PublicKey},
     Signer,
 };
 use commonware_deployer::ec2::Hosts;
-use commonware_p2p::{authenticated::discovery as authenticated, utils::requester, Manager};
-use commonware_runtime::{tokio, Metrics, Runner, Spawner};
-use commonware_utils::{from_hex_formatted, quorum, set::Ordered, union_unique};
+use commonware_p2p::{authenticated::discovery as authenticated, Manager, Ingress};
+use commonware_runtime::{tokio, Metrics, Runner, Spawner, Quota};
+use commonware_utils::{from_hex_formatted, ordered::Set, quorum, TryFromIterator, union_unique};
 use futures::future::try_join_all;
-use governor::Quota;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -117,10 +116,8 @@ fn main() {
                     from_hex_formatted(bootstrapper).expect("Could not parse bootstrapper key");
                 let key = PublicKey::decode(key.as_ref()).expect("Bootstrapper key is invalid");
                 let ip = peers.get(&key).expect("Could not find bootstrapper in IPs");
-                let bootstrapper_socket = format!("{}:{}", ip, config.port);
-                let bootstrapper_socket = SocketAddr::from_str(&bootstrapper_socket)
-                    .expect("Could not parse bootstrapper socket");
-                bootstrappers.push((key, bootstrapper_socket));
+                let bootstrapper_socket = SocketAddr::new(*ip, config.port);
+                bootstrappers.push((key, Ingress::from(bootstrapper_socket)));
             }
             let ip = peers.get(&public_key).expect("Could not find self in IPs");
             (*ip, peer_keys, bootstrappers)
@@ -145,7 +142,7 @@ fn main() {
                     from_hex_formatted(bootstrapper).expect("Could not parse bootstrapper key");
                 let key = PublicKey::decode(key.as_ref()).expect("Bootstrapper key is invalid");
                 let socket = peers.get(&key).expect("Could not find bootstrapper in IPs");
-                bootstrappers.push((key, *socket));
+                bootstrappers.push((key, Ingress::from(*socket)));
             }
             let ip = peers
                 .get(&public_key)
@@ -163,9 +160,9 @@ fn main() {
         let polynomial =
             from_hex_formatted(&config.polynomial).expect("Could not parse polynomial");
         let polynomial =
-            poly::Public::<MinSig>::decode_cfg(polynomial.as_ref(), &(threshold as usize))
+            Sharing::<MinSig>::decode_cfg(polynomial.as_ref(), &commonware_utils::NZU32!(threshold))
                 .expect("polynomial is invalid");
-        let identity = *poly::public::<MinSig>(&polynomial);
+        let identity = *polynomial.public();
         info!(
             ?public_key,
             ?identity,
@@ -183,7 +180,7 @@ fn main() {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
                 SocketAddr::new(ip, config.port),
                 bootstrappers,
-                MAX_MESSAGE_SIZE,
+                MAX_MESSAGE_SIZE as u32,
             )
         } else {
             authenticated::Config::recommended(
@@ -192,7 +189,7 @@ fn main() {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
                 SocketAddr::new(ip, config.port),
                 bootstrappers,
-                MAX_MESSAGE_SIZE,
+                MAX_MESSAGE_SIZE as u32,
             )
         };
         p2p_cfg.mailbox_size = config.mailbox_size;
@@ -202,25 +199,25 @@ fn main() {
             authenticated::Network::new(context.with_label("network"), p2p_cfg);
 
         // Provide authorized peers
-        let participants: Ordered<PublicKey> = peers.clone().into();
+        let participants: Set<PublicKey> = Set::try_from_iter(peers.clone()).expect("duplicate peers");
         oracle.update(EPOCH, participants.clone()).await;
 
         // Register pending channel
         let pending_limit = Quota::per_second(NonZeroU32::new(128).unwrap());
-        let pending = network.register(PENDING_CHANNEL, pending_limit, config.message_backlog);
+        let (pending_sender, pending_receiver) = network.register(PENDING_CHANNEL, pending_limit, config.message_backlog);
 
         // Register recovered channel
         let recovered_limit = Quota::per_second(NonZeroU32::new(128).unwrap());
-        let recovered =
+        let (recovered_sender, recovered_receiver) =
             network.register(RECOVERED_CHANNEL, recovered_limit, config.message_backlog);
 
         // Register resolver channel
         let resolver_limit = Quota::per_second(NonZeroU32::new(128).unwrap());
-        let resolver = network.register(RESOLVER_CHANNEL, resolver_limit, config.message_backlog);
+        let (resolver_sender, resolver_receiver) = network.register(RESOLVER_CHANNEL, resolver_limit, config.message_backlog);
 
         // Register broadcast channel
         let broadcaster_limit = Quota::per_second(NonZeroU32::new(8).unwrap());
-        let broadcaster = network.register(
+        let (broadcaster_sender, broadcaster_receiver) = network.register(
             BROADCASTER_CHANNEL,
             broadcaster_limit,
             config.message_backlog,
@@ -228,7 +225,7 @@ fn main() {
 
         // Register marshal channel
         let marshal_quota = Quota::per_second(NonZeroU32::new(8).unwrap());
-        let marshal = network.register(MARSHAL_CHANNEL, marshal_quota, config.message_backlog);
+        let (marshal_sender, marshal_receiver) = network.register(MARSHAL_CHANNEL, marshal_quota, config.message_backlog);
 
         // Create network
         let p2p = network.start();
@@ -248,7 +245,7 @@ fn main() {
             me: public_key.clone(),
             polynomial,
             share,
-            participants: peers.clone().into(),
+            participants: Set::try_from_iter(peers.clone()).expect("duplicate peers"),
             mailbox_size: config.mailbox_size,
             deque_size: config.deque_size,
             leader_timeout: LEADER_TIMEOUT,
@@ -260,30 +257,33 @@ fn main() {
             max_fetch_count: MAX_FETCH_COUNT,
             max_fetch_size: MAX_FETCH_SIZE,
             fetch_concurrent: FETCH_CONCURRENT,
-            fetch_rate_per_peer: resolver_limit,
+            fetch_rate_per_peer: Quota::per_second(NonZeroU32::new(128).unwrap()),
             indexer,
         };
         let (engine, mempool, balances) = engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await;
 
         let marshal_resolver_cfg = marshal::resolver::p2p::Config {
             public_key: public_key.clone(),
-            manager: oracle,
+            manager: oracle.clone(),
+            blocker: oracle,
             mailbox_size: config.mailbox_size,
-            requester_config: requester::Config {
-                me: Some(public_key),
-                rate_limit: Quota::per_second(NonZeroU32::new(5).unwrap()),
-                initial: Duration::from_secs(1),
-                timeout: Duration::from_secs(2),
-            },
+            initial: Duration::from_secs(1),
+            timeout: Duration::from_secs(2),
             fetch_retry_timeout: Duration::from_millis(100),
             priority_requests: false,
             priority_responses: false,
         };
         let marshal_resolver =
-            marshal::resolver::p2p::init(&context, marshal_resolver_cfg, marshal);
+            marshal::resolver::p2p::init(&context, marshal_resolver_cfg, (marshal_sender, marshal_receiver));
 
         // Start engine
-        let engine = engine.start(pending, recovered, resolver, broadcaster, marshal_resolver);
+        let engine = engine.start(
+            (pending_sender, pending_receiver),
+            (recovered_sender, recovered_receiver),
+            (resolver_sender, resolver_receiver),
+            (broadcaster_sender, broadcaster_receiver),
+            (marshal_resolver.0, marshal_resolver.1),
+        );
 
         let api_port = config.metrics_port + 1000;
         let api_mempool = mempool.clone();

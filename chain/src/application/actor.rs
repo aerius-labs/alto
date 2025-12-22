@@ -169,7 +169,7 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                         height = built.1.height,
                         "broadcast requested"
                     );
-                    marshal.broadcast(built.1.clone()).await;
+                    marshal.proposed(built.0, built.1.clone()).await;
                 }
                 Message::Verify {
                     round,

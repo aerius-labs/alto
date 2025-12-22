@@ -121,7 +121,7 @@ impl<E: Spawner + Metrics, I: Indexer> Reporter for Pusher<E, I> {
         match activity {
             Activity::Notarization(notarization) => {
                 // Upload seed to indexer
-                let view = notarization.view();
+                let view = notarization.view().get();
                 self.context.with_label("notarized_seed").spawn({
                     let indexer = self.indexer.clone();
                     let seed = notarization.seed();
@@ -163,7 +163,7 @@ impl<E: Spawner + Metrics, I: Indexer> Reporter for Pusher<E, I> {
             }
             Activity::Finalization(finalization) => {
                 // Upload seed to indexer
-                let view = finalization.view();
+                let view = finalization.view().get();
                 self.context.with_label("finalized_seed").spawn({
                     let indexer = self.indexer.clone();
                     let seed = finalization.seed();

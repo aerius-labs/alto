@@ -3,7 +3,7 @@ use commonware_consensus::{
     marshal::Update,
     simplex::types::Context,
     types::{Epoch, Round, View},
-    Automaton, Relay, Reporter,
+    Automaton, CertifiableAutomaton, Relay, Reporter,
 };
 use commonware_cryptography::sha256::Digest;
 use futures::{
@@ -110,11 +110,15 @@ impl Relay for Mailbox {
     }
 }
 
+impl CertifiableAutomaton for Mailbox {
+    // Uses default certify implementation which always returns true
+}
+
 impl Reporter for Mailbox {
     type Activity = Update<Block>;
 
     async fn report(&mut self, update: Self::Activity) {
-        let Update::Block(block) = update else {
+        let Update::Block(block, _ack) = update else {
             return;
         };
         self.sender

@@ -1,7 +1,6 @@
 use crate::{Client, Error, IndexQuery, Query};
 use alto_types::{Block, Finalized, Kind, Notarized, Seed, NAMESPACE};
 use commonware_codec::{DecodeExt, Encode};
-use commonware_consensus::Viewable;
 use commonware_cryptography::Digestible;
 use futures::{channel::mpsc::unbounded, Stream, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TMessage};
@@ -87,7 +86,7 @@ impl Client {
         match query {
             IndexQuery::Latest => {}
             IndexQuery::Index(index) => {
-                if seed.view() != index {
+                if seed.round.view().get() != index {
                     return Err(Error::UnexpectedResponse);
                 }
             }
@@ -130,7 +129,7 @@ impl Client {
         match query {
             IndexQuery::Latest => {}
             IndexQuery::Index(index) => {
-                if notarized.proof.view() != index {
+                if notarized.proof.proposal.round.view().get() != index {
                     return Err(Error::UnexpectedResponse);
                 }
             }
@@ -173,7 +172,7 @@ impl Client {
         match query {
             IndexQuery::Latest => {}
             IndexQuery::Index(index) => {
-                if finalized.proof.view() != index {
+                if finalized.proof.proposal.round.view().get() != index {
                     return Err(Error::UnexpectedResponse);
                 }
             }

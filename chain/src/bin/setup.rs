@@ -3,12 +3,13 @@ use clap::{value_parser, Arg, ArgMatches, Command};
 use commonware_codec::{Decode, DecodeExt, Encode};
 use commonware_cryptography::{
     bls12381::{
-        dkg::ops,
-        primitives::{poly, variant::MinSig},
+        dkg::deal_anonymous,
+        primitives::{sharing::Sharing, variant::MinSig},
     },
     ed25519::{PrivateKey, PublicKey},
-    PrivateKeyExt, Signer,
+    Signer,
 };
+use commonware_math::algebra::Random;
 use commonware_deployer::ec2::{self, METRICS_PORT};
 use commonware_utils::{from_hex_formatted, hex, quorum};
 use rand::{rngs::OsRng, seq::IteratorRandom};
@@ -258,7 +259,7 @@ fn generate_local(
         "bootstrappers must be less than or equal to peers"
     );
     let mut peer_signers = (0..peers)
-        .map(|_| PrivateKey::from_rng(&mut OsRng))
+        .map(|_| PrivateKey::random(&mut OsRng))
         .collect::<Vec<_>>();
     peer_signers.sort_by_key(|signer| signer.public_key());
     let allowed_peers: Vec<String> = peer_signers
@@ -274,10 +275,9 @@ fn generate_local(
 
     // Generate consensus key
     let peers_u32 = peers as u32;
-    let threshold = quorum(peers_u32);
     let (polynomial, shares) =
-        ops::generate_shares::<_, MinSig>(&mut OsRng, None, peers_u32, threshold);
-    info!(identity = ?poly::public::<MinSig>(&polynomial), "generated network key");
+        deal_anonymous::<MinSig>(&mut OsRng, Default::default(), commonware_utils::NZU32!(peers_u32));
+    info!(identity = ?polynomial.public(), "generated network key");
 
     // Generate instance configurations
     let mut port = start_port;
@@ -405,7 +405,7 @@ fn generate_remote(
         "bootstrappers must be less than or equal to peers"
     );
     let mut peer_signers = (0..peers)
-        .map(|_| PrivateKey::from_rng(&mut OsRng))
+        .map(|_| PrivateKey::random(&mut OsRng))
         .collect::<Vec<_>>();
     peer_signers.sort_by_key(|signer| signer.public_key());
     let allowed_peers: Vec<String> = peer_signers
@@ -421,10 +421,9 @@ fn generate_remote(
 
     // Generate consensus key
     let peers_u32 = peers as u32;
-    let threshold = quorum(peers_u32);
     let (polynomial, shares) =
-        ops::generate_shares::<_, MinSig>(&mut OsRng, None, peers_u32, threshold);
-    info!(identity = ?poly::public::<MinSig>(&polynomial), "generated network key");
+        deal_anonymous::<MinSig>(&mut OsRng, Default::default(), commonware_utils::NZU32!(peers_u32));
+    info!(identity = ?polynomial.public(), "generated network key");
 
     // Generate instance configurations
     assert!(
@@ -688,9 +687,9 @@ fn explorer(sub_matches: &ArgMatches) {
         serde_yaml::from_str(&peer_config_content).expect("failed to parse peer config");
     let polynomial_hex = peer_config.polynomial;
     let polynomial = from_hex_formatted(&polynomial_hex).expect("invalid polynomial");
-    let polynomial = poly::Public::<MinSig>::decode_cfg(polynomial.as_ref(), &(threshold as usize))
+    let polynomial = Sharing::<MinSig>::decode_cfg(polynomial.as_ref(), &commonware_utils::NZU32!(threshold))
         .expect("polynomial is invalid");
-    let identity = poly::public::<MinSig>(&polynomial);
+    let identity = polynomial.public();
     let config_ts = format!(
         "export const BACKEND_URL = \"{}\";\n\
         export const PUBLIC_KEY_HEX = \"{}\";\n\

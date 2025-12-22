@@ -1,5 +1,6 @@
 use alto_types::Scheme;
-use commonware_consensus::marshal::SchemeProvider;
+use commonware_consensus::types::Epoch;
+use commonware_cryptography::certificate::Provider;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
@@ -45,10 +46,11 @@ pub struct Peers {
 #[derive(Clone)]
 pub struct StaticSchemeProvider(Arc<Scheme>);
 
-impl SchemeProvider for StaticSchemeProvider {
+impl Provider for StaticSchemeProvider {
+    type Scope = Epoch;
     type Scheme = Scheme;
 
-    fn scheme(&self, _epoch: u64) -> Option<Arc<Scheme>> {
+    fn scoped(&self, _epoch: Epoch) -> Option<Arc<Scheme>> {
         Some(self.0.clone())
     }
 }
