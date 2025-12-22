@@ -75,7 +75,9 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
         // Compute genesis digest
         self.hasher.update(GENESIS);
         let genesis_parent = self.hasher.finalize();
-        let genesis = Block::new(genesis_parent, 0, 0, Vec::new());
+        // Genesis state root: hash of empty state (will be replaced with qmdb root)
+        let genesis_state_root = Sha256::hash(b"");
+        let genesis = Block::new(genesis_parent, 0, 0, Vec::new(), genesis_state_root);
         let genesis_digest = genesis.digest();
         let built: Option<(Round, Block)> = None;
         let built = Arc::new(Mutex::new(built));
@@ -120,11 +122,14 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                                         current = parent.timestamp + 1;
                                     }
                                     let transactions = mempool.take(10);
+                                    // TODO: Get state_root from qmdb
+                                    let state_root = Sha256::hash(b""); // Placeholder
                                     let block = Block::new(
                                         parent.digest(),
                                         parent.height + 1,
                                         current,
                                         transactions.clone(),
+                                        state_root,
                                     );
                                     let digest = block.digest();
                                     {

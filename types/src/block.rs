@@ -52,12 +52,15 @@ pub struct Block {
     /// Transactions in this block.
     pub transactions: Vec<Transaction>,
 
+    /// The Merkle root of the state after executing this block's transactions.
+    pub state_root: Digest,
+
     /// Pre-computed digest of the block.
     digest: Digest,
 }
 
 impl Block {
-    fn compute_digest(parent: &Digest, height: u64, timestamp: u64, transactions: &[Transaction]) -> Digest {
+    fn compute_digest(parent: &Digest, height: u64, timestamp: u64, transactions: &[Transaction], state_root: &Digest) -> Digest {
         let mut hasher = Sha256::new();
         hasher.update(parent);
         hasher.update(&height.to_be_bytes());
@@ -67,16 +70,18 @@ impl Block {
             tx.write(&mut tx_buf);
         }
         hasher.update(&tx_buf);
+        hasher.update(state_root);
         hasher.finalize()
     }
 
-    pub fn new(parent: Digest, height: u64, timestamp: u64, transactions: Vec<Transaction>) -> Self {
-        let digest = Self::compute_digest(&parent, height, timestamp, &transactions);
+    pub fn new(parent: Digest, height: u64, timestamp: u64, transactions: Vec<Transaction>, state_root: Digest) -> Self {
+        let digest = Self::compute_digest(&parent, height, timestamp, &transactions, &state_root);
         Self {
             parent,
             height,
             timestamp,
             transactions,
+            state_root,
             digest,
         }
     }
@@ -91,6 +96,7 @@ impl Write for Block {
         for tx in &self.transactions {
             tx.write(writer);
         }
+        self.state_root.write(writer);
     }
 }
 
@@ -106,14 +112,16 @@ impl Read for Block {
         for _ in 0..tx_count {
             transactions.push(Transaction::read(reader)?);
         }
+        let state_root = Digest::read(reader)?;
 
         // Pre-compute the digest
-        let digest = Self::compute_digest(&parent, height, timestamp, &transactions);
+        let digest = Self::compute_digest(&parent, height, timestamp, &transactions, &state_root);
         Ok(Self {
             parent,
             height,
             timestamp,
             transactions,
+            state_root,
             digest,
         })
     }
@@ -126,6 +134,7 @@ impl EncodeSize for Block {
             + UInt(self.timestamp).encode_size()
             + UInt(self.transactions.len() as u64).encode_size()
             + self.transactions.iter().map(|tx| tx.encode_size()).sum::<usize>()
+            + self.state_root.encode_size()
     }
 }
 
