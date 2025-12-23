@@ -260,7 +260,13 @@ fn main() {
             fetch_rate_per_peer: Quota::per_second(NonZeroU32::new(128).unwrap()),
             indexer,
         };
-        let (engine, mempool, balances) = engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await;
+        let (engine, mempool, qmdb) = match engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await {
+            Ok(result) => result,
+            Err(e) => {
+                error!(?e, "failed to create engine");
+                return;
+            }
+        };
 
         let marshal_resolver_cfg = marshal::resolver::p2p::Config {
             public_key: public_key.clone(),
@@ -285,17 +291,19 @@ fn main() {
             (marshal_resolver.0, marshal_resolver.1),
         );
 
-        let api_port = config.metrics_port + 1000;
-        let api_mempool = mempool.clone();
-        let api_balances = balances.clone();
-        let api_handle = context.with_label("api").spawn(move |_| async move {
-            if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_balances, api_port).await {
-                error!(?e, "API server failed");
-            }
-        });
+        // todo: update API to use qmdb instead of balances
+        // for now disabling the api
+        // let api_port = config.metrics_port + 1000;
+        // let api_mempool = mempool.clone();
+        // let api_qmdb = qmdb.clone();
+        // let api_handle = context.with_label("api").spawn(move |_| async move {
+        //     if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_qmdb, api_port).await {
+        //         error!(?e, "API server failed");
+        //     }
+        // });
 
         // Wait for any task to error
-        if let Err(e) = try_join_all(vec![p2p, engine, api_handle]).await {
+        if let Err(e) = try_join_all(vec![p2p, engine]).await {
             error!(?e, "task failed");
         }
     });

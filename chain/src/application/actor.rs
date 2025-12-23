@@ -8,13 +8,18 @@ use alto_types::{Block, Scheme};
 use commonware_consensus::{marshal, types::Round};
 use commonware_cryptography::{Committable, Digestible, Hasher, Sha256};
 use commonware_macros::select;
-use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Metrics, Spawner};
-use commonware_utils::SystemTimeExt;
+use commonware_runtime::{buffer::PoolRef, spawn_cell, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
+use commonware_storage::{
+    qmdb::current::ordered::fixed::Db as Current,
+    translator::TwoCap,
+    qmdb::Error as QmdbError,
+};
+use commonware_utils::{sequence::FixedBytes, NZUsize, NZU64, SystemTimeExt};
 use futures::StreamExt;
 use futures::{channel::mpsc, future::try_join};
 use futures::{future, future::Either};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -27,43 +32,70 @@ const SYNCHRONY_BOUND: u64 = 500;
 const GENESIS_BALANCE: u64 = 1000;
 
 /// Application actor.
-pub struct Actor<R: Rng + Spawner + Metrics + Clock> {
+pub struct Actor<R: Rng + Spawner + Metrics + Clock + Storage> {
     context: ContextCell<R>,
     hasher: Sha256,
     mailbox: mpsc::Receiver<Message>,
-    balances: Arc<Mutex<HashMap<u64, u64>>>,
+    qmdb: Arc<Mutex<Current<R, FixedBytes<8>, u64, Sha256, TwoCap, 64>>>,
     processed_heights: Arc<Mutex<HashSet<u64>>>,
     mempool: Mempool,
 }
 
-impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
+impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
     /// Create a new application actor.
-    pub fn new(context: R, config: Config) -> (Self, Mailbox, Mempool, Arc<Mutex<HashMap<u64, u64>>>) {
+    pub async fn new(context: R, config: Config) -> Result<(Self, Mailbox, Mempool, Arc<Mutex<Current<R, FixedBytes<8>, u64, Sha256, TwoCap, 64>>>), QmdbError> {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
         
-        let mut balances = HashMap::new();
-        for i in 0..10 {
-            balances.insert(i, GENESIS_BALANCE);
+        // Configure qmdb
+        let qmdb_config = commonware_storage::qmdb::current::FixedConfig {
+            mmr_journal_partition: "state_mmr_journal".into(),
+            mmr_metadata_partition: "state_mmr_metadata".into(),
+            mmr_items_per_blob: NZU64!(4096),
+            mmr_write_buffer: NZUsize!(1024),
+            log_journal_partition: "state_log_journal".into(),
+            log_items_per_blob: NZU64!(4096),
+            log_write_buffer: NZUsize!(1024),
+            bitmap_metadata_partition: "state_bitmap_metadata".into(),
+            translator: TwoCap,
+            thread_pool: None,
+            buffer_pool: PoolRef::new(NZUsize!(1024), NZUsize!(10)),
+        };
+        
+        // Initialize qmdb
+        let mut qmdb = Current::<_, FixedBytes<8>, u64, Sha256, TwoCap, 64>::init(
+            context.with_label("qmdb"),
+            qmdb_config,
+        ).await?;
+        
+        // Initialize genesis balances
+        // todo: Fix commit() call
+        let mut dirty = qmdb.into_dirty();
+        for i in 0u64..10 {
+            let key = FixedBytes::new(i.to_be_bytes());
+            dirty.update(key, GENESIS_BALANCE).await?;
         }
+        // todo: apply commit
+        // for now just using the dirty state directly
+        qmdb = dirty.merkleize().await?;
         
         let mempool = Mempool::new(config.mempool_max_size);
         let mempool_clone = mempool.clone();
-        let balances_arc = Arc::new(Mutex::new(balances));
-        let balances_clone = balances_arc.clone();
+        let qmdb_arc = Arc::new(Mutex::new(qmdb));
+        let qmdb_clone = qmdb_arc.clone();
         
-        (
+        Ok((
             Self {
                 context: ContextCell::new(context),
                 hasher: Sha256::new(),
                 mailbox,
-                balances: balances_clone,
+                qmdb: qmdb_clone,
                 processed_heights: Arc::new(Mutex::new(HashSet::new())),
                 mempool: mempool_clone,
             },
             Mailbox::new(sender),
             mempool,
-            balances_arc,
-        )
+            qmdb_arc,
+        ))
     }
 
     pub fn start(mut self, marshal: marshal::Mailbox<Scheme, Block>) -> Handle<()> {
@@ -192,7 +224,7 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                     // continue processing other messages)
                     self.context.with_label("verify").spawn({
                         let mut marshal = marshal.clone();
-                        let balances = self.balances.clone();
+                        let qmdb = self.qmdb.clone();
                         move |context| async move {
                             let requester =
                                 try_join(parent_request, marshal.subscribe(None, payload).await);
@@ -221,7 +253,8 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                                         return;
                                     }
 
-                                    if !Self::verify_transactions(&block, &balances) {
+                                    // todo: update verify_transactions to use qmdb
+                                    if !Self::verify_transactions(&block, &qmdb).await {
                                         warn!(height = block.height, "transaction verification failed");
                                         let _ = response.send(false);
                                         return;
@@ -251,7 +284,8 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
                         processed.insert(block.height);
                     }
 
-                    self.execute_transactions(&block);
+                    // todo: update execute_transactions to use qmdb
+                    self.execute_transactions(&block).await;
 
                     info!(
                         height = block.height,
@@ -264,66 +298,16 @@ impl<R: Rng + Spawner + Metrics + Clock> Actor<R> {
         }
     }
 
-    fn verify_transactions(block: &Block, balances: &Arc<Mutex<HashMap<u64, u64>>>) -> bool {
-        let balances = balances.lock().unwrap();
-        let mut temp_balances = balances.clone();
-        
-        for tx in &block.transactions {
-            let sender_balance = temp_balances.get(&tx.from).copied().unwrap_or(0);
-            if sender_balance < tx.amount {
-                return false;
-            }
-            
-            if tx.amount == 0 {
-                return false;
-            }
-            
-            *temp_balances.entry(tx.from).or_insert(0) -= tx.amount;
-            *temp_balances.entry(tx.to).or_insert(0) += tx.amount;
-        }
-        
+   // todo
+    async fn verify_transactions<R2: Rng + Spawner + Metrics + Clock + Storage>(
+        _block: &Block, 
+        _qmdb: &Arc<Mutex<Current<R2, FixedBytes<8>, u64, Sha256, TwoCap, 64>>>
+    ) -> bool {
         true
     }
 
-    fn execute_transactions(&self, block: &Block) {
-        let mut balances = self.balances.lock().unwrap();
-        
-        for tx in &block.transactions {
-            let sender_balance = balances.get(&tx.from).copied().unwrap_or(0);
-            let receiver_balance = balances.get(&tx.to).copied().unwrap_or(0);
-            
-            if sender_balance >= tx.amount {
-                let new_sender_balance = sender_balance - tx.amount;
-                let new_receiver_balance = receiver_balance + tx.amount;
-                
-                *balances.entry(tx.from).or_insert(0) = new_sender_balance;
-                *balances.entry(tx.to).or_insert(0) = new_receiver_balance;
-                
-                info!(
-                    from = tx.from,
-                    to = tx.to,
-                    amount = tx.amount,
-                    from_balance_before = sender_balance,
-                    from_balance_after = new_sender_balance,
-                    to_balance_before = receiver_balance,
-                    to_balance_after = new_receiver_balance,
-                    "executed transfer"
-                );
-            } else {
-                warn!(
-                    from = tx.from,
-                    to = tx.to,
-                    amount = tx.amount,
-                    balance = sender_balance,
-                    "insufficient balance (should not happen after verification)"
-                );
-            }
-        }
-        
-        info!(
-            height = block.height,
-            total_accounts = balances.len(),
-            "state updated after block finalization"
-        );
+    // todo
+    async fn execute_transactions(&self, _block: &Block) {
+        info!("execute_transactions called");
     }
 }

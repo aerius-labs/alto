@@ -124,19 +124,19 @@ impl<
     pub async fn new_with_mempool(
         context: E,
         cfg: Config<B, I>,
-    ) -> (
+    ) -> Result<(
         Self,
         application::Mempool,
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
-    ) {
+        std::sync::Arc<std::sync::Mutex<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>,
+    ), commonware_storage::qmdb::Error> {
         // Create the application
-        let (application, application_mailbox, mempool, balances) = application::Actor::new(
+        let (application, application_mailbox, mempool, qmdb) = application::Actor::new(
             context.with_label("application"),
             application::Config {
                 mailbox_size: cfg.mailbox_size,
                 mempool_max_size: 1000,
             },
-        );
+        ).await?;
 
         // Create the buffer
         let (buffer, buffer_mailbox) = buffered::Engine::new(
@@ -290,8 +290,8 @@ impl<
             },
         );
 
-        // Return the engine, mempool, and balances
-        (
+        // Return the engine, mempool, and qmdb
+        Ok((
             Self {
                 context: ContextCell::new(context),
 
@@ -304,19 +304,19 @@ impl<
                 consensus,
             },
             mempool,
-            balances,
-        )
+            qmdb,
+        ))
     }
 
     /// Create a new [Engine] (for backward compatibility).
     pub async fn new(
         context: E,
         cfg: Config<B, I>,
-    ) -> (
+    ) -> Result<(
         Self,
         application::Mempool,
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
-    ) {
+        std::sync::Arc<std::sync::Mutex<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>,
+    ), commonware_storage::qmdb::Error> {
         Self::new_with_mempool(context, cfg).await
     }
 
