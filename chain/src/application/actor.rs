@@ -393,7 +393,175 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
     }
 
 
-    async fn execute_transactions(&self, _block: &Block) {
-        info!("execute_transactions called");
+    async fn execute_transactions(&self, block: &Block) {
+        // Need to extract QMDB from the mutex since into_dirty() takes ownership
+        let qmdb = unsafe {
+            let qmdb_guard = self.qmdb.lock().unwrap();
+            std::ptr::read(&*qmdb_guard)
+        };
+        
+        if block.transactions.is_empty() {
+            let root = qmdb.root();
+            if root != block.state_root {
+                warn!(
+                    height = block.height,
+                    expected = ?block.state_root,
+                    actual = ?root,
+                    "state root mismatch for empty block"
+                );
+            }
+            unsafe {
+                let mut qmdb_guard = self.qmdb.lock().unwrap();
+                std::ptr::write(&mut *qmdb_guard, qmdb);
+            }
+            return;
+        }
+
+        let mut dirty = qmdb.into_dirty();
+
+        for tx in &block.transactions {
+            let from_key = FixedBytes::new(tx.from.to_be_bytes());
+            let to_key = FixedBytes::new(tx.to.to_be_bytes());
+
+            let from_balance = match dirty.get(&from_key).await {
+                Ok(Some(balance)) => balance,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(
+                        height = block.height,
+                        from = tx.from,
+                        error = ?e,
+                        "failed to get sender balance"
+                    );
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    unsafe {
+            let mut qmdb_guard = self.qmdb.lock().unwrap();
+                        std::ptr::write(&mut *qmdb_guard, clean);
+                    }
+                    return;
+                }
+            };
+
+            let to_balance = match dirty.get(&to_key).await {
+                Ok(Some(balance)) => balance,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(
+                height = block.height,
+                        to = tx.to,
+                        error = ?e,
+                        "failed to get receiver balance"
+                    );
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    unsafe {
+                        let mut qmdb_guard = self.qmdb.lock().unwrap();
+                        std::ptr::write(&mut *qmdb_guard, clean);
+                    }
+                    return;
+                }
+            };
+
+            if from_balance < tx.amount {
+                warn!(
+                    height = block.height,
+                    from = tx.from,
+                    balance = from_balance,
+                    amount = tx.amount,
+                    "insufficient balance in execute_transactions (should have been caught in verification)"
+                );
+                let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                    panic!("failed to merkleize after error: {:?}", e);
+                });
+                unsafe {
+                    let mut qmdb_guard = self.qmdb.lock().unwrap();
+                    std::ptr::write(&mut *qmdb_guard, clean);
+                }
+                return;
+            }
+
+            if let Err(e) = dirty.update(from_key, from_balance - tx.amount).await {
+                warn!(
+                    height = block.height,
+                    from = tx.from,
+                    error = ?e,
+                    "failed to update sender balance"
+                );
+                let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                    panic!("failed to merkleize after error: {:?}", e);
+                });
+                unsafe {
+                    let mut qmdb_guard = self.qmdb.lock().unwrap();
+                    std::ptr::write(&mut *qmdb_guard, clean);
+                }
+                return;
+            }
+
+            if let Err(e) = dirty.update(to_key, to_balance + tx.amount).await {
+                warn!(
+                    height = block.height,
+                    to = tx.to,
+                    error = ?e,
+                    "failed to update receiver balance"
+                );
+                let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                    panic!("failed to merkleize after error: {:?}", e);
+                });
+                unsafe {
+                    let mut qmdb_guard = self.qmdb.lock().unwrap();
+                    std::ptr::write(&mut *qmdb_guard, clean);
+                }
+                return;
+            }
+        }
+
+        let mut clean = match dirty.merkleize().await {
+            Ok(clean) => clean,
+            Err(e) => {
+                warn!(
+                    height = block.height,
+                    error = ?e,
+                    "failed to merkleize after applying transactions"
+                );
+                return;
+            }
+        };
+
+        let root_after_merkleize = clean.root();
+        
+        if root_after_merkleize != block.state_root {
+            warn!(
+                height = block.height,
+                expected = ?block.state_root,
+                actual = ?root_after_merkleize,
+                "state root mismatch after merkleize (before commit)"
+            );
+        }
+
+        match clean.commit(None).await {
+            Ok(_range) => {
+                info!(
+                height = block.height,
+                    tx_count = block.transactions.len(),
+                state_root = ?root_after_merkleize,
+                    "successfully executed and committed transactions"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    height = block.height,
+                    error = ?e,
+                    "failed to commit transactions"
+                );
+            }
+        }
+
+        unsafe {
+            let mut qmdb_guard = self.qmdb.lock().unwrap();
+            std::ptr::write(&mut *qmdb_guard, clean);
+        }
     }
 }
