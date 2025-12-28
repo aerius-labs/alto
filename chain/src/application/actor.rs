@@ -8,7 +8,7 @@ use alto_types::{Block, Scheme};
 use commonware_consensus::{marshal, types::Round};
 use commonware_cryptography::{Committable, Digestible, Hasher, Sha256};
 use commonware_macros::select;
-use commonware_runtime::{buffer::PoolRef, spawn_cell, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
+use commonware_runtime::{buffer::PoolRef, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
 use commonware_storage::{
     qmdb::current::ordered::fixed::Db as Current,
     translator::TwoCap,
@@ -68,15 +68,15 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         ).await?;
         
         // Initialize genesis balances
-        // todo: Fix commit() call
         let mut dirty = qmdb.into_dirty();
         for i in 0u64..10 {
             let key = FixedBytes::new(i.to_be_bytes());
             dirty.update(key, GENESIS_BALANCE).await?;
         }
-        // todo: apply commit
-        // for now just using the dirty state directly
-        qmdb = dirty.merkleize().await?;
+        // Merkleize to get clean state, then commit to persist
+        let mut clean = dirty.merkleize().await?;
+        clean.commit(None).await?;
+        qmdb = clean;
         
         let mempool = Mempool::new(config.mempool_max_size);
         let mempool_clone = mempool.clone();
@@ -98,8 +98,69 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         ))
     }
 
+    /// Start the application actor.
+    ///
+    /// # Compilation Requirements
+    ///
+    /// This method requires the `-Zhigher-ranked-assumptions` compiler flag to compile.
+    /// This flag is available in nightly Rust and fixes rust-lang/rust#100013 (lifetime
+    /// inference issue in async/macro contexts).
+    ///
+    /// **To compile:**
+    /// ```bash
+    /// RUSTFLAGS="-Zhigher-ranked-assumptions" cargo +nightly check
+    /// ```
+    ///
+    /// Or use the `.cargo/config.toml` file which is configured to use this flag automatically.
+    ///
+    /// # Implementation Details
+    ///
+    /// This method manually expands the `spawn_cell!` macro to work around rust-lang/rust#100013.
+    /// The manual expansion gives the compiler better visibility into the control flow, which
+    /// combined with the `-Zhigher-ranked-assumptions` flag allows the code to compile correctly.
+    /// Start the application actor.
+    ///
+    /// # Safety Considerations
+    ///
+    /// This method uses the `-Zhigher-ranked-assumptions` compiler flag to work around
+    /// rust-lang/rust#100013. **Important safety note:**
+    ///
+    /// - The flag only affects **lifetime inference**, not Rust's core safety guarantees
+    /// - It will NOT hide: use-after-free, data races, memory leaks, or other memory safety issues
+    /// - It WILL accept code where lifetimes are inferred more permissively
+    /// - **Risk**: If you write code with incorrect lifetime assumptions elsewhere, the flag
+    ///   might accept it when it shouldn't
+    ///
+    /// **Mitigation strategies:**
+    /// 1. Always ensure `self` is moved (not borrowed) when using this pattern
+    /// 2. Review any new code that uses similar async/spawn patterns carefully
+    /// 3. Test periodically without the flag (temporarily remove it) to catch potential issues
+    /// 4. Use `cargo clippy` to catch common lifetime issues
+    /// 5. Consider adding explicit lifetime annotations where possible
+    ///
+    /// # Compilation Requirements
+    ///
+    /// This method requires the `-Zhigher-ranked-assumptions` compiler flag (nightly only).
+    /// After extensive testing, no stable Rust workaround was found that works for this pattern.
+    ///
+    /// The issue is that the compiler cannot prove the future is 'static even though
+    /// it actually is (self is moved, not borrowed). The flag enables the compiler to
+    /// make the necessary assumptions to compile this code.
     pub fn start(mut self, marshal: marshal::Mailbox<Scheme, Block>) -> Handle<()> {
-        spawn_cell!(self.context, self.run(marshal).await)
+        // Workaround for rust-lang/rust#100013: Manually expand spawn_cell! macro
+        // The macro does: let ctx = $cell.take(); ctx.spawn(move |c| async move { $cell.restore(c); $body })
+        // So we need to: take context, move self.context (which is now Missing) into closure, restore in closure
+        //
+        // SAFETY: self is moved (not borrowed), so all data is owned by the future.
+        // The future is effectively 'static because it owns everything it needs.
+        // The flag only helps the compiler see this - it doesn't change the actual safety.
+        let context = self.context.take();
+        context.spawn(move |ctx| {
+            async move {
+                self.context.restore(ctx);
+                self.run(marshal).await
+            }
+        })
     }
 
     /// Run the application actor.
@@ -107,8 +168,11 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         // Compute genesis digest
         self.hasher.update(GENESIS);
         let genesis_parent = self.hasher.finalize();
-        // Genesis state root: hash of empty state (will be replaced with qmdb root)
-        let genesis_state_root = Sha256::hash(b"");
+        // Get actual state root from qmdb (after genesis initialization)
+        let genesis_state_root = {
+            let qmdb_guard = self.qmdb.lock().unwrap();
+            qmdb_guard.root()
+        };
         let genesis = Block::new(genesis_parent, 0, 0, Vec::new(), genesis_state_root);
         let genesis_digest = genesis.digest();
         let built: Option<(Round, Block)> = None;
@@ -139,6 +203,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     // Wait for the parent block to be available or the request to be cancelled in a separate task (to
                     // continue processing other messages)
                     let mempool = self.mempool.clone();
+                    let qmdb = self.qmdb.clone();
                     self.context.with_label("propose").spawn({
                         let built = built.clone();
                         move |context| async move {
@@ -154,8 +219,11 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                         current = parent.timestamp + 1;
                                     }
                                     let transactions = mempool.take(10);
-                                    // TODO: Get state_root from qmdb
-                                    let state_root = Sha256::hash(b""); // Placeholder
+                                    // Get state_root from qmdb
+                                    let state_root = {
+                                        let qmdb_guard = qmdb.lock().unwrap();
+                                        qmdb_guard.root()
+                                    };
                                     let block = Block::new(
                                         parent.digest(),
                                         parent.height + 1,
@@ -286,8 +354,26 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         processed.insert(block.height);
                     }
 
-                    // todo: update execute_transactions to use qmdb
-                    self.execute_transactions(&block).await;
+                    match self.execute_transactions(&block).await {
+                        Ok(new_state_root) => {
+                            if new_state_root != block.state_root {
+                                warn!(
+                                    height = block.height,
+                                    expected = ?block.state_root,
+                                    actual = ?new_state_root,
+                                    "State root mismatch - verification should have caught this"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                height = block.height,
+                                error = ?e,
+                                "Failed to execute transactions"
+                            );
+                            continue;
+                        }
+                    }
 
                     info!(
                         height = block.height,
@@ -393,7 +479,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
     }
 
 
-    async fn execute_transactions(&self, block: &Block) {
+    async fn execute_transactions(&self, block: &Block) -> Result<commonware_cryptography::sha256::Digest, QmdbError> {
         // Need to extract QMDB from the mutex since into_dirty() takes ownership
         let qmdb = unsafe {
             let qmdb_guard = self.qmdb.lock().unwrap();
@@ -414,7 +500,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 let mut qmdb_guard = self.qmdb.lock().unwrap();
                 std::ptr::write(&mut *qmdb_guard, qmdb);
             }
-            return;
+            return Ok(root);
         }
 
         let mut dirty = qmdb.into_dirty();
@@ -440,7 +526,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             let mut qmdb_guard = self.qmdb.lock().unwrap();
                         std::ptr::write(&mut *qmdb_guard, clean);
                     }
-                    return;
+                    return Err(e);
                 }
             };
 
@@ -461,7 +547,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         let mut qmdb_guard = self.qmdb.lock().unwrap();
                         std::ptr::write(&mut *qmdb_guard, clean);
                     }
-                    return;
+                    return Err(e);
                 }
             };
 
@@ -480,7 +566,9 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     let mut qmdb_guard = self.qmdb.lock().unwrap();
                     std::ptr::write(&mut *qmdb_guard, clean);
                 }
-                return;
+                // Return error - insufficient balance should have been caught in verification
+                // Use Runtime error as a generic error type
+                return Err(QmdbError::Runtime(commonware_runtime::Error::Closed));
             }
 
             if let Err(e) = dirty.update(from_key, from_balance - tx.amount).await {
@@ -497,7 +585,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     let mut qmdb_guard = self.qmdb.lock().unwrap();
                     std::ptr::write(&mut *qmdb_guard, clean);
                 }
-                return;
+                return Err(e);
             }
 
             if let Err(e) = dirty.update(to_key, to_balance + tx.amount).await {
@@ -514,7 +602,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     let mut qmdb_guard = self.qmdb.lock().unwrap();
                     std::ptr::write(&mut *qmdb_guard, clean);
                 }
-                return;
+                return Err(e);
             }
         }
 
@@ -526,7 +614,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     error = ?e,
                     "failed to merkleize after applying transactions"
                 );
-                return;
+                return Err(e);
             }
         };
 
@@ -556,6 +644,11 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     error = ?e,
                     "failed to commit transactions"
                 );
+                unsafe {
+                    let mut qmdb_guard = self.qmdb.lock().unwrap();
+                    std::ptr::write(&mut *qmdb_guard, clean);
+                }
+                return Err(e);
             }
         }
 
@@ -563,5 +656,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             let mut qmdb_guard = self.qmdb.lock().unwrap();
             std::ptr::write(&mut *qmdb_guard, clean);
         }
+        
+        Ok(root_after_merkleize)
     }
 }

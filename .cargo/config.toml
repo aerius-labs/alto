@@ -1,0 +1,21 @@
+# Cargo configuration for alto project
+#
+# This file configures Rust flags needed to compile the project.
+# The -Zhigher-ranked-assumptions flag is required to work around
+# rust-lang/rust#100013 (lifetime bound inference issue in async contexts).
+#
+# SAFETY NOTE: This flag makes the compiler more permissive about lifetime inference.
+# It does NOT affect Rust's core safety guarantees (ownership, borrowing, memory safety).
+# However, it could potentially accept code with incorrect lifetime assumptions.
+#
+# Best practices when using this flag:
+# 1. Always move (not borrow) data into async futures that need 'static bounds
+# 2. Review new async/spawn code carefully for lifetime correctness
+# 3. Periodically test without the flag (comment it out) to catch potential issues
+# 4. Use `cargo clippy` to catch common lifetime problems
+# 5. Add explicit lifetime annotations where possible
+#
+[build]
+# Note: This flag is only available in nightly Rust
+# To use stable Rust, you'll need to wait for the compiler fix
+rustflags = ["-Zhigher-ranked-assumptions"]
