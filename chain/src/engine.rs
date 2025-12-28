@@ -127,7 +127,7 @@ impl<
     ) -> Result<(
         Self,
         application::Mempool,
-        std::sync::Arc<std::sync::Mutex<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>,
+        std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
     ), commonware_storage::qmdb::Error> {
         // Create the application
         let (application, application_mailbox, mempool, qmdb) = application::Actor::new(
@@ -315,7 +315,7 @@ impl<
     ) -> Result<(
         Self,
         application::Mempool,
-        std::sync::Arc<std::sync::Mutex<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>,
+        std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
     ), commonware_storage::qmdb::Error> {
         Self::new_with_mempool(context, cfg).await
     }

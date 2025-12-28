@@ -6,6 +6,7 @@ use commonware_consensus::{
     Automaton, CertifiableAutomaton, Relay, Reporter,
 };
 use commonware_cryptography::sha256::Digest;
+use commonware_utils::acknowledgement::Exact;
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
@@ -32,6 +33,7 @@ pub enum Message {
     },
     Finalized {
         block: Block,
+        ack: Exact,
     },
 }
 
@@ -118,11 +120,11 @@ impl Reporter for Mailbox {
     type Activity = Update<Block>;
 
     async fn report(&mut self, update: Self::Activity) {
-        let Update::Block(block, _ack) = update else {
+        let Update::Block(block, ack) = update else {
             return;
         };
         self.sender
-            .send(Message::Finalized { block })
+            .send(Message::Finalized { block, ack })
             .await
             .expect("Failed to send finalized");
     }

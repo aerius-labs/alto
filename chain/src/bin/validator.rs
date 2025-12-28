@@ -291,16 +291,16 @@ fn main() {
             (marshal_resolver.0, marshal_resolver.1),
         );
 
-        // todo: update API to use qmdb instead of balances
-        // for now disabling the api
-        // let api_port = config.metrics_port + 1000;
-        // let api_mempool = mempool.clone();
-        // let api_qmdb = qmdb.clone();
-        // let api_handle = context.with_label("api").spawn(move |_| async move {
-        //     if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_qmdb, api_port).await {
-        //         error!(?e, "API server failed");
-        //     }
-        // });
+        // Start API server
+        let api_port = config.metrics_port + 1000;
+        let api_mempool = mempool.clone();
+        let api_qmdb: std::sync::Arc<::tokio::sync::Mutex<Option<commonware_storage::qmdb::current::ordered::fixed::Db<tokio::Context, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64, commonware_storage::mmr::mem::Clean<commonware_cryptography::sha256::Digest>>>>> = qmdb.clone();
+        let _api_handle = context.with_label("api").spawn(move |_| async move {
+            if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_qmdb, api_port).await {
+                error!(?e, "API server failed");
+            }
+        });
+        info!(port = api_port, "Starting API server");
 
         // Wait for any task to error
         if let Err(e) = try_join_all(vec![p2p, engine]).await {

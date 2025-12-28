@@ -7,10 +7,18 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use commonware_cryptography::Sha256;
+use commonware_runtime::tokio::Context as TokioContext;
+use commonware_storage::{
+    qmdb::current::ordered::fixed::Db as Current,
+    translator::TwoCap,
+};
+use commonware_utils::sequence::FixedBytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Serialize)]
@@ -44,22 +52,24 @@ struct SubmitTxRequest {
     amount: u64,
 }
 
+type Qmdb = Current<TokioContext, FixedBytes<8>, u64, Sha256, TwoCap, 64>;
+
 #[derive(Clone)]
 struct ApiState {
     mempool: Arc<Mempool>,
-    balances: Arc<Mutex<HashMap<u64, u64>>>,
+    qmdb: Arc<Mutex<Option<Qmdb>>>,
 }
 
 pub async fn start_api_server(
     mempool: Mempool,
-    balances: Arc<Mutex<HashMap<u64, u64>>>,
+    qmdb: Arc<Mutex<Option<Qmdb>>>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     
     let state = ApiState {
         mempool: Arc::new(mempool),
-        balances,
+        qmdb,
     };
     
     let app = Router::new()
@@ -96,9 +106,20 @@ async fn submit_transaction(
         }));
     }
     
-    let balances = state.balances.lock().unwrap();
-    let sender_balance = balances.get(&payload.from).copied().unwrap_or(0);
-    drop(balances);
+    // Query balance from QMDB
+    let sender_balance = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            let key = FixedBytes::new(payload.from.to_be_bytes());
+            match qmdb_ref.get(&key).await {
+                Ok(Some(balance)) => balance,
+                Ok(None) => 0,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    };
     
     if sender_balance < payload.amount {
         return Ok(Json(SubmitTxResponse {
@@ -147,19 +168,49 @@ async fn get_balance(
     State(state): State<ApiState>,
     Path(account): Path<u64>,
 ) -> Json<BalanceResponse> {
-    let balances = state.balances.lock().unwrap();
-    let balance = balances.get(&account).copied().unwrap_or(0);
+    let balance = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            let key = FixedBytes::new(account.to_be_bytes());
+            match qmdb_ref.get(&key).await {
+                Ok(Some(b)) => b,
+                Ok(None) => 0,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    };
     Json(BalanceResponse { account, balance })
 }
 
 async fn get_all_balances(
     State(state): State<ApiState>,
 ) -> Json<AllBalancesResponse> {
-    let balances = state.balances.lock().unwrap();
-    let balances_clone = balances.clone();
-    let total_accounts = balances_clone.len();
+    let mut balances = HashMap::new();
+    {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            // Query balances for accounts 0-99
+            for account_id in 0u64..100 {
+                let key = FixedBytes::new(account_id.to_be_bytes());
+                match qmdb_ref.get(&key).await {
+                    Ok(Some(balance)) => {
+                        balances.insert(account_id, balance);
+                    }
+                    Ok(None) => {
+                        // Account doesn't exist, balance is 0
+                    }
+                    Err(_) => {
+                        // Error querying, skip this account
+                    }
+                }
+            }
+        }
+    }
+    let total_accounts = balances.len();
     Json(AllBalancesResponse {
-        balances: balances_clone,
+        balances,
         total_accounts,
     })
 }
