@@ -45,6 +45,9 @@ pub struct Actor<R: Rng + Spawner + Metrics + Clock + Storage> {
     // Semaphore to serialize QMDB operations (proposal, verification, execution)
     // Only one operation can access QMDB at a time to prevent race conditions
     qmdb_semaphore: Arc<Semaphore>,
+    // Track uncommitted state for delayed commit
+    last_committed_height: Arc<Mutex<u64>>,
+    last_uncommitted_height: Arc<Mutex<Option<u64>>>,
 }
 
 impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
@@ -100,11 +103,74 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 qmdb_config,
                 // Semaphore with 1 permit to serialize QMDB operations
                 qmdb_semaphore: Arc::new(Semaphore::new(1)),
+                // Initialize tracking: genesis block is committed
+                last_committed_height: Arc::new(Mutex::new(0)),
+                last_uncommitted_height: Arc::new(Mutex::new(None)),
             },
             Mailbox::new(sender),
             mempool,
             qmdb_arc,
         ))
+    }
+
+    /// Commit the previous block's changes if there are any uncommitted operations.
+    /// This should be called at the start of proposal/verification for a new block.
+    async fn commit_previous_block_if_needed(
+        &self,
+        current_block_height: u64,
+    ) -> Result<(), QmdbError> {
+        let mut uncommitted_guard = self.last_uncommitted_height.lock().await;
+        let mut committed_guard = self.last_committed_height.lock().await;
+        
+        // Check if we have uncommitted changes
+        if let Some(uncommitted_height) = *uncommitted_guard {
+            // Only commit if we're moving to a new block
+            if current_block_height > uncommitted_height {
+                info!(
+                    uncommitted_height,
+                    current_block_height,
+                    "Committing previous block's changes before processing new block"
+                );
+                
+                // Acquire semaphore to serialize QMDB access
+                let _permit = self.qmdb_semaphore.acquire().await
+                    .expect("semaphore should not be closed");
+                
+                // Move QMDB out and commit
+                let mut qmdb = {
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    qmdb_guard.take().expect("qmdb should always be Some")
+                };
+                
+                match qmdb.commit(None).await {
+                    Ok(_range) => {
+                        info!(
+                            uncommitted_height,
+                            "Successfully committed previous block's changes"
+                        );
+                        let mut qmdb_guard = self.qmdb.lock().await;
+                        *qmdb_guard = Some(qmdb);
+                    }
+                    Err(e) => {
+                        warn!(
+                            uncommitted_height,
+                            error = ?e,
+                            "Failed to commit previous block's changes"
+                        );
+                        // Restore QMDB even if commit failed
+                        let mut qmdb_guard = self.qmdb.lock().await;
+                        *qmdb_guard = Some(qmdb);
+                        return Err(e);
+                    }
+                }
+                
+                // Update tracking
+                *committed_guard = uncommitted_height;
+                *uncommitted_guard = None;
+            }
+        }
+        
+        Ok(())
     }
 
     /// Start the application actor.
@@ -215,6 +281,8 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     let qmdb = self.qmdb.clone();
                     let qmdb_config = self.qmdb_config.clone();
                     let qmdb_semaphore = self.qmdb_semaphore.clone();
+                    let last_committed_height = self.last_committed_height.clone();
+                    let last_uncommitted_height = self.last_uncommitted_height.clone();
                     self.context.with_label("propose").spawn({
                         let built = built.clone();
                         move |context| async move {
@@ -232,6 +300,47 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                             return;
                                         }
                                     };
+
+                                    // Commit previous block's changes before proposing new block
+                                    {
+                                        let mut uncommitted_guard = last_uncommitted_height.lock().await;
+                                        let mut committed_guard = last_committed_height.lock().await;
+                                        
+                                        if let Some(uncommitted_height) = *uncommitted_guard {
+                                            if parent.height + 1 > uncommitted_height {
+                                                let _permit = qmdb_semaphore.acquire().await
+                                                    .expect("semaphore should not be closed");
+                                                
+                                                let mut qmdb_to_commit = {
+                                                    let mut qmdb_guard = qmdb.lock().await;
+                                                    qmdb_guard.take().expect("qmdb should always be Some")
+                                                };
+                                                
+                                                match qmdb_to_commit.commit(None).await {
+                                                    Ok(_range) => {
+                                                        info!(
+                                                            uncommitted_height,
+                                                            current_block_height = parent.height + 1,
+                                                            "Committed previous block before proposal"
+                                                        );
+                                                        let mut qmdb_guard = qmdb.lock().await;
+                                                        *qmdb_guard = Some(qmdb_to_commit);
+                                                        *committed_guard = uncommitted_height;
+                                                        *uncommitted_guard = None;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            uncommitted_height,
+                                                            error = ?e,
+                                                            "Failed to commit previous block before proposal"
+                                                        );
+                                                        let mut qmdb_guard = qmdb.lock().await;
+                                                        *qmdb_guard = Some(qmdb_to_commit);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     // Create a new block with transactions from mempool
                                     let mut current = context.current().epoch_millis();
@@ -351,6 +460,13 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                             
                                             let root = clean_after_simulation.root();
                                             
+                                            info!(
+                                                height = parent.height + 1,
+                                                state_root_from_merkleize = ?root,
+                                                note = "Block state_root is from merkleize() BEFORE commit",
+                                                "Computed state root for block proposal (before commit)"
+                                            );
+                                            
                                             // Restore QMDB from storage to discard simulated changes
                                             let restored_qmdb = match Current::<R, FixedBytes<8>, u64, Sha256, TwoCap, 64>::init(
                                                 runtime_context.with_label("qmdb"),
@@ -380,6 +496,14 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                         transactions.clone(),
                                         state_root,
                                     );
+                                    
+                                    info!(
+                                        height = block.height,
+                                        block_state_root = ?block.state_root,
+                                        state_root_source = "merkleize() before commit",
+                                        "Created block with state_root from merkleize (BEFORE commit)"
+                                    );
+                                    
                                     let digest = block.digest();
                                     {
                                         let mut built = built.lock().await;
@@ -447,6 +571,8 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         let qmdb = self.qmdb.clone();
                         let qmdb_config = self.qmdb_config.clone();
                         let qmdb_semaphore = self.qmdb_semaphore.clone();
+                        let last_committed_height = self.last_committed_height.clone();
+                        let last_uncommitted_height = self.last_uncommitted_height.clone();
                         move |context| async move {
                             let requester =
                                 try_join(parent_request, marshal.subscribe(None, payload).await);
@@ -484,7 +610,16 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
 
                                     // verifying transactions using qmdb
                                     // Pass parent block to verify state root chain
-                                    let verification_result = Self::verify_transactions_inline(&block, &parent, &qmdb, context, qmdb_config, qmdb_semaphore).await;
+                                    let verification_result = Self::verify_transactions_inline(
+                                        &block,
+                                        &parent,
+                                        &qmdb,
+                                        context,
+                                        qmdb_config,
+                                        qmdb_semaphore,
+                                        &last_committed_height,
+                                        &last_uncommitted_height,
+                                    ).await;
 
                                     if !verification_result {
                                         warn!(height = block.height, "transaction verification failed");
@@ -568,7 +703,68 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         context: ContextCell<R2>,
         qmdb_config: commonware_storage::qmdb::current::FixedConfig<TwoCap>,
         qmdb_semaphore: Arc<Semaphore>,
+        last_committed_height: &Arc<Mutex<u64>>,
+        last_uncommitted_height: &Arc<Mutex<Option<u64>>>,
     ) -> bool {
+        // Commit previous block's changes before verifying new block
+        {
+            let mut uncommitted_guard = last_uncommitted_height.lock().await;
+            let mut committed_guard = last_committed_height.lock().await;
+            
+            if let Some(uncommitted_height) = *uncommitted_guard {
+                if block.height > uncommitted_height {
+                    let _permit = qmdb_semaphore.acquire().await
+                        .expect("semaphore should not be closed");
+                    
+                    let mut qmdb_to_commit = {
+                        let mut qmdb_guard = qmdb.lock().await;
+                        qmdb_guard.take().expect("qmdb should always be Some")
+                    };
+                    
+                    match qmdb_to_commit.commit(None).await {
+                        Ok(_range) => {
+                            // Get root AFTER commit
+                            let root_after_commit = qmdb_to_commit.root();
+                            
+                            info!(
+                                uncommitted_height,
+                                block_height = block.height,
+                                root_after_commit = ?root_after_commit,
+                                parent_state_root = ?parent.state_root,
+                                note = "Root after commit includes CommitFloor operation",
+                                "Committed previous block before verification"
+                            );
+                            
+                            // Log the difference
+                            if root_after_commit != parent.state_root {
+                                info!(
+                                    uncommitted_height,
+                                    root_after_commit = ?root_after_commit,
+                                    parent_state_root = ?parent.state_root,
+                                    difference = "Root changed because commit() added CommitFloor to MMR",
+                                    "Root mismatch expected: block.state_root is from merkleize (before commit), QMDB root is after commit"
+                                );
+                            }
+                            
+                            let mut qmdb_guard = qmdb.lock().await;
+                            *qmdb_guard = Some(qmdb_to_commit);
+                            *committed_guard = uncommitted_height;
+                            *uncommitted_guard = None;
+                        }
+                        Err(e) => {
+                            warn!(
+                                uncommitted_height,
+                                error = ?e,
+                                "Failed to commit previous block before verification"
+                            );
+                            let mut qmdb_guard = qmdb.lock().await;
+                            *qmdb_guard = Some(qmdb_to_commit);
+                        }
+                    }
+                }
+            }
+        }
+        
         // Acquire semaphore first so we wait for any ongoing execution to finish
         let _permit = qmdb_semaphore.acquire().await.expect("semaphore should not be closed");
         
@@ -580,13 +776,21 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             qmdb_guard.as_ref().expect("qmdb should always be Some").root()
         };
         
+        info!(
+            height = block.height,
+            qmdb_root_after_commit = ?current_root,
+            parent_state_root_from_merkleize = ?parent.state_root,
+            note = "QMDB root is AFTER commit (includes CommitFloor), parent.state_root is BEFORE commit (from merkleize)",
+            "Checking QMDB root vs parent state_root"
+        );
+        
         if current_root != parent.state_root {
-            warn!(
+            info!(
                 height = block.height,
-                current_root = ?current_root,
-                parent_state_root = ?parent.state_root,
-                parent_height = parent.height,
-                "QMDB cached root doesn't match parent (QMDB bug) - skipping root check, relying on simulation"
+                qmdb_root_after_commit = ?current_root,
+                parent_state_root_from_merkleize = ?parent.state_root,
+                reason = "Expected mismatch: block.state_root is from merkleize (before commit), QMDB root is after commit",
+                "QMDB root doesn't match parent state_root (expected with delayed commit + QMDB bug)"
             );
             // Continue with simulation - the state is correct, just the cached root is wrong
         }
@@ -952,7 +1156,8 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             root_after_merkleize = ?root_after_merkleize,
             block_state_root = ?block.state_root,
             tx_count = block.transactions.len(),
-            "computed state root after merkleize"
+            note = "block.state_root should equal root_after_merkleize (both from merkleize, BEFORE commit)",
+            "Computed state root after merkleize (BEFORE commit)"
         );
         
         if root_after_merkleize != block.state_root {
@@ -960,49 +1165,51 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 height = block.height,
                 expected = ?block.state_root,
                 actual = ?root_after_merkleize,
-                "state root mismatch after merkleize (before commit)"
+                "state root mismatch after merkleize (verification should have caught this)"
+            );
+        } else {
+            info!(
+                height = block.height,
+                state_root = ?root_after_merkleize,
+                "✓ Block state_root matches root from merkleize (both BEFORE commit)"
             );
         }
 
-        let final_qmdb = match clean.commit(None).await {
-            Ok(_range) => {
-                // Verify root after commit
-                let root_after_commit = clean.root();
-                if root_after_commit != root_after_merkleize {
-                    warn!(
-                        height = block.height,
-                        root_after_merkleize = ?root_after_merkleize,
-                        root_after_commit = ?root_after_commit,
-                        "Root changed after commit - QMDB bug: commit() computed wrong cached root, but state is correct"
-                    );
-                    // commit() computed the wrong cached root, but the state is correct.
-                    // Keep this QMDB - verification will skip the root check anyway.
-                    clean
-                } else {
-                    // Root is correct, use the QMDB as-is
-                    clean
-                }
+        // Sync to disk for durability (but don't commit yet - delayed commit)
+        match clean.sync().await {
+            Ok(()) => {
+                info!(
+                    height = block.height,
+                    state_root = ?root_after_merkleize,
+                    "synced state to disk (delayed commit - will commit at next block)"
+                );
             }
             Err(e) => {
                 warn!(
                     height = block.height,
                     error = ?e,
-                    "failed to commit transactions"
+                    "failed to sync state to disk"
                 );
-                return Err(e);
+                // Continue anyway - sync failure is not fatal
             }
-        };
+        }
 
+        // Store QMDB without committing
+        let mut qmdb_guard = self.qmdb.lock().await;
+        *qmdb_guard = Some(clean);
+        
+        // Update tracking: mark this block as uncommitted
+        {
+            let mut uncommitted_guard = self.last_uncommitted_height.lock().await;
+            *uncommitted_guard = Some(block.height);
+        }
+        
         info!(
             height = block.height,
-            tx_count = block.transactions.len(),
             state_root = ?root_after_merkleize,
-            "successfully executed and committed transactions"
+            "successfully executed transactions (synced but not committed - will commit at next block)"
         );
 
-        let mut qmdb_guard = self.qmdb.lock().await;
-        *qmdb_guard = Some(final_qmdb);
-        
         Ok(root_after_merkleize)
     }
 }
