@@ -23,7 +23,7 @@ use rand::Rng;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Genesis message to use during initialization.
 const GENESIS: &[u8] = b"commonware is neat";
@@ -316,26 +316,67 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                     qmdb_guard.take().expect("qmdb should always be Some")
                                                 };
                                                 
+                                                // Check root BEFORE commit - should match parent.state_root
+                                                let current_root_before_commit = qmdb_to_commit.root();
+                                                if current_root_before_commit != parent.state_root {
+                                                    error!(
+                                                        uncommitted_height,
+                                                        current_block_height = parent.height + 1,
+                                                        current_root = ?current_root_before_commit,
+                                                        parent_state_root = ?parent.state_root,
+                                                        "QMDB root doesn't match parent state_root before commit - state inconsistency detected, aborting proposal"
+                                                    );
+                                                    // Restore QMDB and abort proposal
+                                                    let mut qmdb_guard = qmdb.lock().await;
+                                                    *qmdb_guard = Some(qmdb_to_commit);
+                                                    return; // Abort this proposal
+                                                }
+                                                
+                                                info!(
+                                                    uncommitted_height,
+                                                    current_block_height = parent.height + 1,
+                                                    root_before_commit = ?current_root_before_commit,
+                                                    parent_state_root = ?parent.state_root,
+                                                    "PROPOSAL Root matches parent state_root before commit - proceeding with commit"
+                                                );
+                                                
                                                 match qmdb_to_commit.commit(None).await {
                                                     Ok(_range) => {
-                                                        info!(
-                                                            uncommitted_height,
-                                                            current_block_height = parent.height + 1,
-                                                            "Committed previous block before proposal"
-                                                        );
+                                                        // Get root AFTER commit - should be different from parent.state_root
+                                                        let root_after_commit = qmdb_to_commit.root();
+                                                        
+                                                        if root_after_commit == parent.state_root {
+                                                            warn!(
+                                                                uncommitted_height,
+                                                                root_after_commit = ?root_after_commit,
+                                                                parent_state_root = ?parent.state_root,
+                                                                "Root didn't change after commit - unexpected behavior"
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                uncommitted_height,
+                                                                root_before_commit = ?current_root_before_commit,
+                                                                root_after_commit = ?root_after_commit,
+                                                                parent_state_root = ?parent.state_root,
+                                                                note = "Root changed after commit (expected: CommitFloor added to MMR)",
+                                                                "Committed previous block before proposal"
+                                                            );
+                                                        }
+                                                        
                                                         let mut qmdb_guard = qmdb.lock().await;
                                                         *qmdb_guard = Some(qmdb_to_commit);
                                                         *committed_guard = uncommitted_height;
                                                         *uncommitted_guard = None;
                                                     }
                                                     Err(e) => {
-                                                        warn!(
+                                                        error!(
                                                             uncommitted_height,
                                                             error = ?e,
                                                             "Failed to commit previous block before proposal"
                                                         );
                                                         let mut qmdb_guard = qmdb.lock().await;
                                                         *qmdb_guard = Some(qmdb_to_commit);
+                                                        return; // Abort proposal on commit failure
                                                     }
                                                 }
                                             }
@@ -651,6 +692,19 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         processed.insert(block.height);
                     }
 
+                    // Log finalized block with full details
+                    // Note: In Alto, block height corresponds to view/slot (each view produces one block)
+                    info!(
+                        slot = block.height, // Block height corresponds to view/slot in Alto
+                        height = block.height,
+                        block_digest = ?block.commitment(),
+                        state_root = ?block.state_root,
+                        tx_count = block.transactions.len(),
+                        timestamp = block.timestamp,
+                        parent_digest = ?block.parent,
+                        "Block finalized and being executed"
+                    );
+
                     let runtime_context = self.context.clone().into_present();
                     match self.execute_transactions(runtime_context, &block).await {
                         Ok(new_state_root) => {
@@ -721,28 +775,52 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         qmdb_guard.take().expect("qmdb should always be Some")
                     };
                     
+                    // Check root BEFORE commit - should match parent.state_root
+                    let current_root_before_commit = qmdb_to_commit.root();
+                    if current_root_before_commit != parent.state_root {
+                        error!(
+                            uncommitted_height,
+                            block_height = block.height,
+                            current_root = ?current_root_before_commit,
+                            parent_state_root = ?parent.state_root,
+                            "QMDB root doesn't match parent state_root before commit - state inconsistency detected, aborting verification"
+                        );
+                        // Restore QMDB and return false (verification failed)
+                        let mut qmdb_guard = qmdb.lock().await;
+                        *qmdb_guard = Some(qmdb_to_commit);
+                        return false;
+                    }
+                    
+                    info!(
+                        uncommitted_height,
+                        block_height = block.height,
+                        root_before_commit = ?current_root_before_commit,
+                        parent_state_root = ?parent.state_root,
+                        "VERIFICATION Root matches parent state_root before commit - proceeding with commit"
+                    );
+                    
                     match qmdb_to_commit.commit(None).await {
                         Ok(_range) => {
-                            // Get root AFTER commit
+                            // Get root AFTER commit - should be different from parent.state_root
                             let root_after_commit = qmdb_to_commit.root();
                             
-                            info!(
-                                uncommitted_height,
-                                block_height = block.height,
-                                root_after_commit = ?root_after_commit,
-                                parent_state_root = ?parent.state_root,
-                                note = "Root after commit includes CommitFloor operation",
-                                "Committed previous block before verification"
-                            );
-                            
-                            // Log the difference
-                            if root_after_commit != parent.state_root {
-                                info!(
+                            if root_after_commit == parent.state_root {
+                                warn!(
                                     uncommitted_height,
+                                    block_height = block.height,
                                     root_after_commit = ?root_after_commit,
                                     parent_state_root = ?parent.state_root,
-                                    difference = "Root changed because commit() added CommitFloor to MMR",
-                                    "Root mismatch expected: block.state_root is from merkleize (before commit), QMDB root is after commit"
+                                    "Root didn't change after commit - unexpected behavior"
+                                );
+                            } else {
+                                info!(
+                                    uncommitted_height,
+                                    block_height = block.height,
+                                    root_before_commit = ?current_root_before_commit,
+                                    root_after_commit = ?root_after_commit,
+                                    parent_state_root = ?parent.state_root,
+                                    note = "Root changed after commit (expected: CommitFloor added to MMR)",
+                                    "Committed previous block before verification"
                                 );
                             }
                             
@@ -752,13 +830,15 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                             *uncommitted_guard = None;
                         }
                         Err(e) => {
-                            warn!(
+                            error!(
                                 uncommitted_height,
+                                block_height = block.height,
                                 error = ?e,
                                 "Failed to commit previous block before verification"
                             );
                             let mut qmdb_guard = qmdb.lock().await;
                             *qmdb_guard = Some(qmdb_to_commit);
+                            return false; // Verification failed due to commit error
                         }
                     }
                 }
@@ -767,33 +847,6 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         
         // Acquire semaphore first so we wait for any ongoing execution to finish
         let _permit = qmdb_semaphore.acquire().await.expect("semaphore should not be closed");
-        
-        // Check if QMDB's root matches parent's state root
-        // commit() has a bug where it computes the wrong cached root, but the state is correct.
-        // If the roots don't match, we skip this check and rely on simulation instead.
-        let current_root = {
-            let qmdb_guard = qmdb.lock().await;
-            qmdb_guard.as_ref().expect("qmdb should always be Some").root()
-        };
-        
-        info!(
-            height = block.height,
-            qmdb_root_after_commit = ?current_root,
-            parent_state_root_from_merkleize = ?parent.state_root,
-            note = "QMDB root is AFTER commit (includes CommitFloor), parent.state_root is BEFORE commit (from merkleize)",
-            "Checking QMDB root vs parent state_root"
-        );
-        
-        if current_root != parent.state_root {
-            info!(
-                height = block.height,
-                qmdb_root_after_commit = ?current_root,
-                parent_state_root_from_merkleize = ?parent.state_root,
-                reason = "Expected mismatch: block.state_root is from merkleize (before commit), QMDB root is after commit",
-                "QMDB root doesn't match parent state_root (expected with delayed commit + QMDB bug)"
-            );
-            // Continue with simulation - the state is correct, just the cached root is wrong
-        }
         
         // Simulate applying the block's transactions and verify the resulting root
         let runtime_context = context.into_present();
