@@ -128,6 +128,7 @@ impl<
         Self,
         application::Mempool,
         std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
+        marshal::Mailbox<Scheme, Block>,
     ), commonware_storage::qmdb::Error> {
         // Create the application
         let (application, application_mailbox, mempool, qmdb) = application::Actor::new(
@@ -290,7 +291,7 @@ impl<
             },
         );
 
-        // Return the engine, mempool, and qmdb
+        // Return the engine, mempool, qmdb, and marshal_mailbox
         Ok((
             Self {
                 context: ContextCell::new(context),
@@ -300,11 +301,12 @@ impl<
                 buffer,
                 buffer_mailbox,
                 marshal,
-                marshal_mailbox,
+                marshal_mailbox: marshal_mailbox.clone(),
                 consensus,
             },
             mempool,
             qmdb,
+            marshal_mailbox,
         ))
     }
 
@@ -316,8 +318,10 @@ impl<
         Self,
         application::Mempool,
         std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
+        marshal::Mailbox<Scheme, Block>,
     ), commonware_storage::qmdb::Error> {
-        Self::new_with_mempool(context, cfg).await
+        let (engine, mempool, qmdb, marshal_mailbox) = Self::new_with_mempool(context, cfg).await?;
+        Ok((engine, mempool, qmdb, marshal_mailbox))
     }
 
     /// Start the [simplex::Engine].

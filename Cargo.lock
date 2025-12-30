@@ -66,6 +66,7 @@ dependencies = [
  "commonware-utils",
  "futures",
  "governor",
+ "hex",
  "prometheus-client 0.22.3",
  "rand 0.8.5",
  "serde",

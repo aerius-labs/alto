@@ -1,4 +1,4 @@
-use alto_types::Transaction;
+use alto_types::{Block, Scheme, Transaction};
 use crate::application::Mempool;
 use axum::{
     extract::{Path, State},
@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use commonware_consensus::marshal;
 use commonware_cryptography::Sha256;
 use commonware_runtime::tokio::Context as TokioContext;
 use commonware_storage::{
@@ -45,6 +46,23 @@ struct AllBalancesResponse {
     total_accounts: usize,
 }
 
+#[derive(Serialize)]
+struct BlockResponse {
+    parent: String,
+    height: u64,
+    timestamp: u64,
+    transactions: Vec<TransactionResponse>,
+    state_root: String,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct TransactionResponse {
+    from: u64,
+    to: u64,
+    amount: u64,
+}
+
 #[derive(Deserialize)]
 struct SubmitTxRequest {
     from: u64,
@@ -58,11 +76,13 @@ type Qmdb = Current<TokioContext, FixedBytes<8>, u64, Sha256, TwoCap, 64>;
 struct ApiState {
     mempool: Arc<Mempool>,
     qmdb: Arc<Mutex<Option<Qmdb>>>,
+    marshal: marshal::Mailbox<Scheme, Block>,
 }
 
 pub async fn start_api_server(
     mempool: Mempool,
     qmdb: Arc<Mutex<Option<Qmdb>>>,
+    marshal: marshal::Mailbox<Scheme, Block>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -70,6 +90,7 @@ pub async fn start_api_server(
     let state = ApiState {
         mempool: Arc::new(mempool),
         qmdb,
+        marshal,
     };
     
     let app = Router::new()
@@ -77,6 +98,7 @@ pub async fn start_api_server(
         .route("/mempool", get(get_mempool_status))
         .route("/balance/:account", get(get_balance))
         .route("/balances", get(get_all_balances))
+        .route("/block/:height", get(get_block_by_height))
         .route("/health", get(health_check))
         .with_state(state);
 
@@ -213,6 +235,47 @@ async fn get_all_balances(
         balances,
         total_accounts,
     })
+}
+
+async fn get_block_by_height(
+    State(state): State<ApiState>,
+    Path(height): Path<u64>,
+) -> Result<Json<BlockResponse>, StatusCode> {
+    use commonware_cryptography::Digestible;
+    let mut marshal = state.marshal.clone();
+    
+    // Get block from marshal by height
+    let block = match marshal.get_block(height).await {
+        Some(block) => block,
+        None => {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
+    
+    // Convert transactions to response format
+    let transactions: Vec<TransactionResponse> = block.transactions
+        .iter()
+        .map(|tx| TransactionResponse {
+            from: tx.from,
+            to: tx.to,
+            amount: tx.amount,
+        })
+        .collect();
+    
+    // Convert digests to hex strings
+    let parent_hex = hex::encode(block.parent);
+    let state_root_hex = hex::encode(block.state_root);
+    // Block implements Digestible trait - use fully qualified path
+    let digest_hex = hex::encode(<Block as Digestible>::digest(&block));
+    
+    Ok(Json(BlockResponse {
+        parent: parent_hex,
+        height: block.height,
+        timestamp: block.timestamp,
+        transactions,
+        state_root: state_root_hex,
+        digest: digest_hex,
+    }))
 }
 
 async fn health_check() -> &'static str {
