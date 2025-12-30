@@ -31,6 +31,9 @@ const GENESIS: &[u8] = b"commonware is neat";
 /// Milliseconds in the future to allow for block timestamps.
 const SYNCHRONY_BOUND: u64 = 500;
 
+/// Minimum time between block proposals in milliseconds (3 seconds).
+const MIN_BLOCK_TIME_MS: u64 = 3000;
+
 const GENESIS_BALANCE: u64 = 1000;
 
 /// Application actor.
@@ -380,6 +383,26 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    // enforcing minimum block time based on parent block timestamp
+                                    {
+                                        let now = context.current().epoch_millis();
+                                        let parent_timestamp = parent.timestamp;
+                                        let elapsed = now.saturating_sub(parent_timestamp);
+                                        
+                                        if elapsed < MIN_BLOCK_TIME_MS {
+                                            let delay_needed = MIN_BLOCK_TIME_MS - elapsed;
+                                            info!(
+                                                elapsed_ms = elapsed,
+                                                delay_needed_ms = delay_needed,
+                                                parent_timestamp = parent_timestamp,
+                                                current_timestamp = now,
+                                                parent_height = parent.height,
+                                                "Enforcing minimum block time - sleeping until 3 seconds after parent block"
+                                            );
+                                            context.sleep(std::time::Duration::from_millis(delay_needed as u64)).await;
                                         }
                                     }
 
