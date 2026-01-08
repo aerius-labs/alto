@@ -260,7 +260,7 @@ fn main() {
             fetch_rate_per_peer: Quota::per_second(NonZeroU32::new(128).unwrap()),
             indexer,
         };
-        let (engine, mempool, qmdb, marshal_mailbox) = match engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await {
+        let (engine, mempool, qmdb, public_keys, marshal_mailbox) = match engine::Engine::new_with_mempool(context.with_label("engine"), engine_cfg).await {
             Ok(result) => result,
             Err(e) => {
                 error!(?e, "failed to create engine");
@@ -296,8 +296,9 @@ fn main() {
         let api_mempool = mempool.clone();
         let api_qmdb: std::sync::Arc<::tokio::sync::Mutex<Option<commonware_storage::qmdb::current::ordered::fixed::Db<tokio::Context, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64, commonware_storage::mmr::mem::Clean<commonware_cryptography::sha256::Digest>>>>> = qmdb.clone();
         let api_marshal = marshal_mailbox.clone();
+        let api_public_keys = public_keys.clone();
         let _api_handle = context.with_label("api").spawn(move |_| async move {
-            if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_qmdb, api_marshal, api_port).await {
+            if let Err(e) = alto_chain::api::start_api_server(api_mempool, api_qmdb, api_marshal, api_public_keys, api_port).await {
                 error!(?e, "API server failed");
             }
         });

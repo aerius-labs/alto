@@ -1,7 +1,11 @@
 use crate::consensus::{Finalization, Notarization, Scheme};
 use bytes::{Buf, BufMut};
 use commonware_codec::{varint::UInt, EncodeSize, Error, Read, ReadExt, Write};
-use commonware_cryptography::{sha256::Digest, Committable, Digestible, Hasher, Sha256};
+use commonware_cryptography::{
+    ed25519::{PublicKey, Signature},
+    sha256::Digest,
+    Committable, Digestible, Hasher, Sha256,
+};
 use rand::rngs::OsRng;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,6 +13,9 @@ pub struct Transaction {
     pub from: u64,
     pub to: u64,
     pub amount: u64,
+    pub nonce: u64,
+    pub signature: Signature,
+    pub public_key: PublicKey,
 }
 
 impl Write for Transaction {
@@ -16,6 +23,9 @@ impl Write for Transaction {
         UInt(self.from).write(writer);
         UInt(self.to).write(writer);
         UInt(self.amount).write(writer);
+        UInt(self.nonce).write(writer);
+        self.signature.write(writer);
+        self.public_key.write(writer);
     }
 }
 
@@ -26,7 +36,10 @@ impl Read for Transaction {
         let from = UInt::read(reader)?.into();
         let to = UInt::read(reader)?.into();
         let amount = UInt::read(reader)?.into();
-        Ok(Self { from, to, amount })
+        let nonce = UInt::read(reader)?.into();
+        let signature = Signature::read(reader)?;
+        let public_key = PublicKey::read(reader)?;
+        Ok(Self { from, to, amount, nonce, signature, public_key })
     }
 }
 
@@ -35,6 +48,9 @@ impl EncodeSize for Transaction {
         UInt(self.from).encode_size()
             + UInt(self.to).encode_size()
             + UInt(self.amount).encode_size()
+            + UInt(self.nonce).encode_size()
+            + self.signature.encode_size()
+            + self.public_key.encode_size()
     }
 }
 

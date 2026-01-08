@@ -128,10 +128,11 @@ impl<
         Self,
         application::Mempool,
         std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
+        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u64, commonware_cryptography::ed25519::PublicKey>>>,
         marshal::Mailbox<Scheme, Block>,
     ), commonware_storage::qmdb::Error> {
         // Create the application
-        let (application, application_mailbox, mempool, qmdb) = application::Actor::new(
+        let (application, application_mailbox, mempool, qmdb, public_keys) = application::Actor::new(
             context.with_label("application"),
             application::Config {
                 mailbox_size: cfg.mailbox_size,
@@ -291,7 +292,7 @@ impl<
             },
         );
 
-        // Return the engine, mempool, qmdb, and marshal_mailbox
+        // Return the engine, mempool, qmdb, public_keys, and marshal_mailbox
         Ok((
             Self {
                 context: ContextCell::new(context),
@@ -306,7 +307,8 @@ impl<
             },
             mempool,
             qmdb,
-            marshal_mailbox,
+            public_keys,
+            marshal_mailbox.clone(),
         ))
     }
 
@@ -320,7 +322,7 @@ impl<
         std::sync::Arc<tokio::sync::Mutex<std::option::Option<commonware_storage::qmdb::current::ordered::fixed::Db<E, commonware_utils::sequence::FixedBytes<8>, u64, commonware_cryptography::Sha256, commonware_storage::translator::TwoCap, 64>>>>,
         marshal::Mailbox<Scheme, Block>,
     ), commonware_storage::qmdb::Error> {
-        let (engine, mempool, qmdb, marshal_mailbox) = Self::new_with_mempool(context, cfg).await?;
+        let (engine, mempool, qmdb, _public_keys, marshal_mailbox) = Self::new_with_mempool(context, cfg).await?;
         Ok((engine, mempool, qmdb, marshal_mailbox))
     }
 

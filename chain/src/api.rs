@@ -1,4 +1,4 @@
-use alto_types::{Block, Scheme, Transaction};
+use alto_types::{Block, Scheme, Transaction, NAMESPACE};
 use crate::application::Mempool;
 use axum::{
     extract::{Path, State},
@@ -8,7 +8,11 @@ use axum::{
     Router,
 };
 use commonware_consensus::marshal;
-use commonware_cryptography::{Sha256, sha256::Digest};
+use commonware_cryptography::{
+    ed25519::{PublicKey, Signature},
+    Sha256, sha256::Digest, Hasher, Verifier,
+};
+use commonware_codec::{Read, ReadExt, Write, varint::UInt};
 use commonware_runtime::tokio::Context as TokioContext;
 use commonware_storage::{
     mmr::{Location, Position, Proof},
@@ -22,13 +26,33 @@ use commonware_storage::{
     translator::TwoCap,
 };
 use commonware_utils::sequence::FixedBytes;
-use commonware_codec::{ReadExt, Write, varint::UInt};
+use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+// Key prefixes for different data types in QMDB
+const KEY_PREFIX_BALANCE: u8 = 0x00;
+const KEY_PREFIX_NONCE: u8 = 0x01;
+
+fn balance_key(account_id: u64) -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_BALANCE;
+    let account_bytes = account_id.to_be_bytes();
+    key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
+
+fn nonce_key(account_id: u64) -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_NONCE;
+    let account_bytes = account_id.to_be_bytes();
+    key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
 
 #[derive(Serialize)]
 struct SubmitTxResponse {
@@ -76,6 +100,9 @@ struct SubmitTxRequest {
     from: u64,
     to: u64,
     amount: u64,
+    nonce: u64,
+    signature: String,
+    public_key: String,
 }
 
 type Qmdb = Current<TokioContext, FixedBytes<8>, u64, Sha256, TwoCap, 64>;
@@ -85,12 +112,14 @@ struct ApiState {
     mempool: Arc<Mempool>,
     qmdb: Arc<Mutex<Option<Qmdb>>>,
     marshal: marshal::Mailbox<Scheme, Block>,
+    public_keys: Arc<Mutex<HashMap<u64, PublicKey>>>,
 }
 
 pub async fn start_api_server(
     mempool: Mempool,
     qmdb: Arc<Mutex<Option<Qmdb>>>,
     marshal: marshal::Mailbox<Scheme, Block>,
+    public_keys: Arc<Mutex<HashMap<u64, PublicKey>>>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -99,6 +128,7 @@ pub async fn start_api_server(
         mempool: Arc::new(mempool),
         qmdb,
         marshal,
+        public_keys,
     };
     
     let app = Router::new()
@@ -122,6 +152,19 @@ pub async fn start_api_server(
     Ok(())
 }
 
+fn compute_transaction_hash(from: u64, to: u64, amount: u64, nonce: u64, public_key: &PublicKey) -> Digest {
+    let mut hasher = Sha256::new();
+    let mut tx_buf = Vec::new();
+    UInt(from).write(&mut tx_buf);
+    UInt(to).write(&mut tx_buf);
+    UInt(amount).write(&mut tx_buf);
+    UInt(nonce).write(&mut tx_buf);
+    public_key.write(&mut tx_buf);
+    hasher.update(NAMESPACE);
+    hasher.update(&tx_buf);
+    hasher.finalize()
+}
+
 async fn submit_transaction(
     State(state): State<ApiState>,
     Json(payload): Json<SubmitTxRequest>,
@@ -140,12 +183,81 @@ async fn submit_transaction(
         }));
     }
     
-    // Query balance from QMDB
+    // Decode signature and public key from hex
+    let signature_bytes = hex::decode(&payload.signature)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut signature_reader = signature_bytes.as_slice();
+    let signature = Signature::read_cfg(&mut signature_reader, &())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    
+    let public_key_bytes = hex::decode(&payload.public_key)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut public_key_reader = public_key_bytes.as_slice();
+    let public_key = PublicKey::read_cfg(&mut public_key_reader, &())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    
+    // Verify public key matches account
+    let public_keys_guard = state.public_keys.lock().await;
+    match public_keys_guard.get(&payload.from) {
+        Some(registered_pk) => {
+            if *registered_pk != public_key {
+                return Ok(Json(SubmitTxResponse {
+                    success: false,
+                    message: format!("Public key doesn't match registered key for account {}", payload.from),
+                }));
+            }
+        }
+        None => {
+            return Ok(Json(SubmitTxResponse {
+                success: false,
+                message: format!("Account {} doesn't have a registered public key", payload.from),
+            }));
+        }
+    }
+    drop(public_keys_guard);
+    
+    // Verify signature
+    let tx_hash = compute_transaction_hash(
+        payload.from,
+        payload.to,
+        payload.amount,
+        payload.nonce,
+        &public_key,
+    );
+    if !public_key.verify(NAMESPACE, tx_hash.as_ref(), &signature) {
+        return Ok(Json(SubmitTxResponse {
+            success: false,
+            message: "Invalid transaction signature".to_string(),
+        }));
+    }
+    
+    // Verify nonce
+    let current_nonce = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            let nonce_key = nonce_key(payload.from);
+            match qmdb_ref.get(&nonce_key).await {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    };
+    
+    if payload.nonce != current_nonce {
+        return Ok(Json(SubmitTxResponse {
+            success: false,
+            message: format!("Invalid nonce. Expected {}, got {}", current_nonce, payload.nonce),
+        }));
+    }
+    
     let sender_balance = {
         let qmdb_guard = state.qmdb.lock().await;
         if let Some(qmdb_ref) = qmdb_guard.as_ref() {
-            let key = FixedBytes::new(payload.from.to_be_bytes());
-            match qmdb_ref.get(&key).await {
+            let balance_key = balance_key(payload.from);
+            match qmdb_ref.get(&balance_key).await {
                 Ok(Some(balance)) => balance,
                 Ok(None) => 0,
                 Err(_) => 0,
@@ -166,6 +278,9 @@ async fn submit_transaction(
         from: payload.from,
         to: payload.to,
         amount: payload.amount,
+        nonce: payload.nonce,
+        signature,
+        public_key,
     };
     
     let added = state.mempool.add(tx);
@@ -175,6 +290,7 @@ async fn submit_transaction(
             from = payload.from,
             to = payload.to,
             amount = payload.amount,
+            nonce = payload.nonce,
             "Transaction submitted to mempool"
         );
         Ok(Json(SubmitTxResponse {
@@ -205,8 +321,8 @@ async fn get_balance(
     let balance = {
         let qmdb_guard = state.qmdb.lock().await;
         if let Some(qmdb_ref) = qmdb_guard.as_ref() {
-            let key = FixedBytes::new(account.to_be_bytes());
-            match qmdb_ref.get(&key).await {
+            let balance_key = balance_key(account);
+            match qmdb_ref.get(&balance_key).await {
                 Ok(Some(b)) => b,
                 Ok(None) => 0,
                 Err(_) => 0,
@@ -227,8 +343,8 @@ async fn get_all_balances(
         if let Some(qmdb_ref) = qmdb_guard.as_ref() {
             // Query balances for accounts 0-99
             for account_id in 0u64..100 {
-                let key = FixedBytes::new(account_id.to_be_bytes());
-                match qmdb_ref.get(&key).await {
+                let balance_key = balance_key(account_id);
+                match qmdb_ref.get(&balance_key).await {
                     Ok(Some(balance)) => {
                         balances.insert(account_id, balance);
                     }
@@ -332,7 +448,7 @@ async fn get_balance_proof(
     State(state): State<ApiState>,
     Path(account): Path<u64>,
 ) -> Result<Json<BalanceProofResponse>, StatusCode> {
-    let key = FixedBytes::new(account.to_be_bytes());
+    let key = balance_key(account);
     
     let (balance, proof_bytes, state_root) = {
         let qmdb_guard = state.qmdb.lock().await;
@@ -398,7 +514,7 @@ async fn get_exclusion_proof(
     State(state): State<ApiState>,
     Path(account): Path<u64>,
 ) -> Result<Json<ExclusionProofResponse>, StatusCode> {
-    let key = FixedBytes::new(account.to_be_bytes());
+    let key = balance_key(account);
     
     let (proof_bytes, state_root) = {
         let qmdb_guard = state.qmdb.lock().await;

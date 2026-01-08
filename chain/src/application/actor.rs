@@ -4,9 +4,13 @@ use super::{
     Config,
 };
 use crate::utils::OneshotClosedFut;
-use alto_types::{Block, Scheme};
+use alto_types::{Block, Scheme, Transaction, NAMESPACE};
 use commonware_consensus::{marshal, types::Round};
-use commonware_cryptography::{Committable, Digestible, Hasher, Sha256};
+use commonware_cryptography::{
+    ed25519::{PrivateKey, PublicKey, Signature},
+    Committable, Digestible, Hasher, Sha256, Signer, Verifier,
+};
+use commonware_math::algebra::Random;
 use commonware_macros::select;
 use commonware_runtime::{buffer::PoolRef, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
 use commonware_storage::{
@@ -14,13 +18,14 @@ use commonware_storage::{
     translator::TwoCap,
     qmdb::Error as QmdbError,
 };
+use commonware_codec::{varint::UInt, Write};
 use commonware_utils::Acknowledgement;
 use commonware_utils::{sequence::FixedBytes, NZUsize, NZU64, SystemTimeExt};
 use futures::StreamExt;
 use futures::{channel::mpsc, future::try_join};
 use futures::{future, future::Either};
-use rand::Rng;
-use std::collections::HashSet;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -32,6 +37,45 @@ const GENESIS: &[u8] = b"commonware is neat";
 const SYNCHRONY_BOUND: u64 = 500;
 
 const GENESIS_BALANCE: u64 = 1000;
+
+// Key prefixes for different data types in QMDB
+const KEY_PREFIX_BALANCE: u8 = 0x00;
+const KEY_PREFIX_NONCE: u8 = 0x01;
+
+fn balance_key(account_id: u64) -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_BALANCE;
+    let account_bytes = account_id.to_be_bytes();
+    key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
+
+fn nonce_key(account_id: u64) -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_NONCE;
+    let account_bytes = account_id.to_be_bytes();
+    key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
+
+fn compute_transaction_hash(tx: &Transaction) -> commonware_cryptography::sha256::Digest {
+    let mut hasher = Sha256::new();
+    let mut tx_buf = Vec::new();
+    // Hash transaction fields (excluding signature)
+    UInt(tx.from).write(&mut tx_buf);
+    UInt(tx.to).write(&mut tx_buf);
+    UInt(tx.amount).write(&mut tx_buf);
+    UInt(tx.nonce).write(&mut tx_buf);
+    tx.public_key.write(&mut tx_buf);
+    hasher.update(NAMESPACE);
+    hasher.update(&tx_buf);
+    hasher.finalize()
+}
+
+fn verify_transaction_signature(tx: &Transaction) -> bool {
+    let tx_hash = compute_transaction_hash(tx);
+    tx.public_key.verify(NAMESPACE, tx_hash.as_ref(), &tx.signature)
+}
 
 /// Application actor.
 pub struct Actor<R: Rng + Spawner + Metrics + Clock + Storage> {
@@ -48,11 +92,14 @@ pub struct Actor<R: Rng + Spawner + Metrics + Clock + Storage> {
     // Track uncommitted state for delayed commit
     last_committed_height: Arc<Mutex<u64>>,
     last_uncommitted_height: Arc<Mutex<Option<u64>>>,
+    // Store public keys for accounts (account_id -> public_key)
+    // TODO: Make this persistent using QMDB or separate storage
+    public_keys: Arc<Mutex<HashMap<u64, PublicKey>>>,
 }
 
 impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
     /// Create a new application actor.
-    pub async fn new(context: R, config: Config) -> Result<(Self, Mailbox, Mempool, Arc<Mutex<Option<Current<R, FixedBytes<8>, u64, Sha256, TwoCap, 64>>>>), QmdbError> {
+    pub async fn new(context: R, config: Config) -> Result<(Self, Mailbox, Mempool, Arc<Mutex<Option<Current<R, FixedBytes<8>, u64, Sha256, TwoCap, 64>>>>, Arc<Mutex<HashMap<u64, PublicKey>>>), QmdbError> {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
         
         // Configure qmdb
@@ -76,11 +123,23 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             qmdb_config.clone(),
         ).await?;
         
-        // Initialize genesis balances
+        // Initialize genesis balances and nonces
         let mut dirty = qmdb.into_dirty();
+        let mut genesis_public_keys = HashMap::new();
         for i in 0u64..10 {
-            let key = FixedBytes::new(i.to_be_bytes());
-            dirty.update(key, GENESIS_BALANCE).await?;
+            use rand::{rngs::StdRng, SeedableRng};
+            let mut seed = [0u8; 32];
+            seed[0..8].copy_from_slice(&i.to_be_bytes());
+            let mut rng = StdRng::from_seed(seed);
+            let private_key = PrivateKey::random(&mut rng);
+            let public_key = private_key.public_key();
+            genesis_public_keys.insert(i, public_key);
+            
+            let balance_key = balance_key(i);
+            dirty.update(balance_key, GENESIS_BALANCE).await?;
+            
+            let nonce_key = nonce_key(i);
+            dirty.update(nonce_key, 0u64).await?;
         }
         // Merkleize to get clean state, then commit to persist
         let mut clean = dirty.merkleize().await?;
@@ -91,6 +150,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         let mempool_clone = mempool.clone();
         let qmdb_arc = Arc::new(Mutex::new(Some(qmdb)));
         let qmdb_clone = qmdb_arc.clone();
+        let public_keys = Arc::new(Mutex::new(genesis_public_keys));
         
         Ok((
             Self {
@@ -106,10 +166,12 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 // Initialize tracking: genesis block is committed
                 last_committed_height: Arc::new(Mutex::new(0)),
                 last_uncommitted_height: Arc::new(Mutex::new(None)),
+                public_keys: public_keys.clone(),
             },
             Mailbox::new(sender),
             mempool,
             qmdb_arc,
+            public_keys,
         ))
     }
 
@@ -614,6 +676,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         let qmdb_semaphore = self.qmdb_semaphore.clone();
                         let last_committed_height = self.last_committed_height.clone();
                         let last_uncommitted_height = self.last_uncommitted_height.clone();
+                        let public_keys = self.public_keys.clone();
                         move |context| async move {
                             let requester =
                                 try_join(parent_request, marshal.subscribe(None, payload).await);
@@ -660,6 +723,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                         qmdb_semaphore,
                                         &last_committed_height,
                                         &last_uncommitted_height,
+                                        &public_keys,
                                     ).await;
 
                                     if !verification_result {
@@ -759,6 +823,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         qmdb_semaphore: Arc<Semaphore>,
         last_committed_height: &Arc<Mutex<u64>>,
         last_uncommitted_height: &Arc<Mutex<Option<u64>>>,
+        public_keys: &Arc<Mutex<HashMap<u64, PublicKey>>>,
     ) -> bool {
         // Commit previous block's changes before verifying new block
         {
@@ -870,6 +935,44 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             *qmdb_guard = Some(original_qmdb);
             result
             } else {
+            // First verify all transaction signatures and nonces
+            {
+                let public_keys_guard = public_keys.lock().await;
+                for tx in &block.transactions {
+                    // Verify signature
+                    if !verify_transaction_signature(tx) {
+                        warn!(
+                            height = block.height,
+                            from = tx.from,
+                            "Transaction signature verification failed"
+                        );
+                        return false;
+                    }
+                    
+                    // Verify public key matches account
+                    match public_keys_guard.get(&tx.from) {
+                        Some(registered_pk) => {
+                            if *registered_pk != tx.public_key {
+                                warn!(
+                                    height = block.height,
+                                    from = tx.from,
+                                    "Transaction public key doesn't match registered public key for account"
+                                );
+                                return false;
+                            }
+                        }
+                        None => {
+                            warn!(
+                                height = block.height,
+                                from = tx.from,
+                                "Account doesn't have a registered public key"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            
             // Simulate transactions on a dirty state
             let mut dirty = original_qmdb.into_dirty();
                 let mut valid = true;
@@ -880,11 +983,34 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         break;
                     }
                     
-                    let from_key = FixedBytes::new(tx.from.to_be_bytes());
-                    let to_key = FixedBytes::new(tx.to.to_be_bytes());
+                    // Verify nonce
+                    let nonce_key = nonce_key(tx.from);
+                    let expected_nonce = match dirty.get(&nonce_key).await {
+                        Ok(Some(n)) => n,
+                        Ok(None) => 0,
+                        Err(_) => {
+                            valid = false;
+                            break;
+                        }
+                    };
+                    
+                    if tx.nonce != expected_nonce {
+                        warn!(
+                            height = block.height,
+                            from = tx.from,
+                            expected_nonce,
+                            tx_nonce = tx.nonce,
+                            "Transaction nonce mismatch"
+                        );
+                        valid = false;
+                        break;
+                    }
+                    
+                    let from_balance_key = balance_key(tx.from);
+                    let to_balance_key = balance_key(tx.to);
                     
                     // Get balances
-                    let from_balance = match dirty.get(&from_key).await {
+                    let from_balance = match dirty.get(&from_balance_key).await {
                         Ok(Some(b)) => b,
                         Ok(None) => 0,
                         Err(_) => {
@@ -899,12 +1025,12 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     }
                     
                     // Apply transaction
-                    if dirty.update(from_key, from_balance - tx.amount).await.is_err() {
+                    if dirty.update(from_balance_key, from_balance - tx.amount).await.is_err() {
                         valid = false;
                         break;
                     }
                     
-                    let to_balance = match dirty.get(&to_key).await {
+                    let to_balance = match dirty.get(&to_balance_key).await {
                         Ok(Some(b)) => b,
                         Ok(None) => 0,
                         Err(_) => {
@@ -913,7 +1039,12 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         }
                     };
                     
-                    if dirty.update(to_key, to_balance + tx.amount).await.is_err() {
+                    if dirty.update(to_balance_key, to_balance + tx.amount).await.is_err() {
+                        valid = false;
+                        break;
+                    }
+                    
+                    if dirty.update(nonce_key, expected_nonce + 1).await.is_err() {
                         valid = false;
                         break;
                     }
@@ -1032,16 +1163,19 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             let qmdb_guard = qmdb.lock().await;
             let qmdb_ref = qmdb_guard.as_ref().expect("qmdb should always be Some");
             for &account_id in &accounts_to_query {
-                let key = FixedBytes::new(account_id.to_be_bytes());
+                let mut key = [0u8; 8];
+                key[0] = 0x00; // Balance prefix
+                key[1..].copy_from_slice(&account_id.to_be_bytes()[..7]);
+                let balance_key = FixedBytes::new(key);
                 // Awaiting while holding the guard is fine here since we're not spawning
-                match qmdb_ref.get(&key).await {
+                match qmdb_ref.get(&balance_key).await {
                     Ok(Some(balance)) => {
                         balances.insert(account_id, balance);
                     }
                     Ok(None) => {
                         balances.insert(account_id, 0);
-                        }
-                        Err(e) => {
+                    }
+                    Err(e) => {
                         return Err(e);
                     }
                 }
@@ -1100,10 +1234,30 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
         let mut dirty = qmdb.into_dirty();
 
         for tx in &block.transactions {
-            let from_key = FixedBytes::new(tx.from.to_be_bytes());
-            let to_key = FixedBytes::new(tx.to.to_be_bytes());
+            let from_balance_key = balance_key(tx.from);
+            let to_balance_key = balance_key(tx.to);
+            let nonce_key = nonce_key(tx.from);
 
-            let from_balance = match dirty.get(&from_key).await {
+            let current_nonce = match dirty.get(&nonce_key).await {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(
+                        height = block.height,
+                        from = tx.from,
+                        error = ?e,
+                        "failed to get nonce"
+                    );
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+            };
+
+            let from_balance = match dirty.get(&from_balance_key).await {
                 Ok(Some(balance)) => balance,
                 Ok(None) => 0,
                 Err(e) => {
@@ -1122,7 +1276,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 }
             };
 
-            let to_balance = match dirty.get(&to_key).await {
+            let to_balance = match dirty.get(&to_balance_key).await {
                 Ok(Some(balance)) => balance,
                 Ok(None) => 0,
                 Err(e) => {
@@ -1159,7 +1313,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 return Err(QmdbError::Runtime(commonware_runtime::Error::Closed));
             }
 
-            if let Err(e) = dirty.update(from_key, from_balance - tx.amount).await {
+            if let Err(e) = dirty.update(from_balance_key, from_balance - tx.amount).await {
                 warn!(
                     height = block.height,
                     from = tx.from,
@@ -1169,12 +1323,12 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
-                    let mut qmdb_guard = self.qmdb.lock().await;
+                let mut qmdb_guard = self.qmdb.lock().await;
                 *qmdb_guard = Some(clean);
                 return Err(e);
             }
 
-            if let Err(e) = dirty.update(to_key, to_balance + tx.amount).await {
+            if let Err(e) = dirty.update(to_balance_key, to_balance + tx.amount).await {
                 warn!(
                     height = block.height,
                     to = tx.to,
@@ -1185,6 +1339,21 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
                     let mut qmdb_guard = self.qmdb.lock().await;
+                *qmdb_guard = Some(clean);
+                return Err(e);
+            }
+            
+            if let Err(e) = dirty.update(nonce_key, current_nonce + 1).await {
+                warn!(
+                    height = block.height,
+                    from = tx.from,
+                    error = ?e,
+                    "failed to increment nonce"
+                );
+                let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                    panic!("failed to merkleize after error: {:?}", e);
+                });
+                let mut qmdb_guard = self.qmdb.lock().await;
                 *qmdb_guard = Some(clean);
                 return Err(e);
             }

@@ -51,3 +51,7 @@ path = "src/bin/validator.rs"
 [[bin]]
 name = "setup"
 path = "src/bin/setup.rs"
+
+[[bin]]
+name = "generate_test_tx"
+path = "src/bin/generate_test_tx.rs"
