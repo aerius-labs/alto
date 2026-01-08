@@ -5,7 +5,7 @@
 use alto_types::NAMESPACE;
 use commonware_codec::{varint::UInt, Write};
 use commonware_cryptography::{
-    ed25519::{PrivateKey, PublicKey},
+    ed25519::PrivateKey,
     Hasher, Sha256, Signer,
 };
 use commonware_math::algebra::Random;

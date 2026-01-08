@@ -7,7 +7,7 @@ use crate::utils::OneshotClosedFut;
 use alto_types::{Block, Scheme, Transaction, NAMESPACE};
 use commonware_consensus::{marshal, types::Round};
 use commonware_cryptography::{
-    ed25519::{PrivateKey, PublicKey, Signature},
+    ed25519::{PrivateKey, PublicKey},
     Committable, Digestible, Hasher, Sha256, Signer, Verifier,
 };
 use commonware_math::algebra::Random;
@@ -24,7 +24,7 @@ use commonware_utils::{sequence::FixedBytes, NZUsize, NZU64, SystemTimeExt};
 use futures::StreamExt;
 use futures::{channel::mpsc, future::try_join};
 use futures::{future, future::Either};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
@@ -481,11 +481,27 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                     break;
                                                 }
                                                 
-                                                let from_key = FixedBytes::new(tx.from.to_be_bytes());
-                                                let to_key = FixedBytes::new(tx.to.to_be_bytes());
+                                                let from_balance_key = balance_key(tx.from);
+                                                let to_balance_key = balance_key(tx.to);
+                                                let nonce_key = nonce_key(tx.from);
+                                                
+                                                // Verify nonce
+                                                let expected_nonce = match dirty.get(&nonce_key).await {
+                                                    Ok(Some(n)) => n,
+                                                    Ok(None) => 0,
+                                                    Err(_) => {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                };
+                                                
+                                                if tx.nonce != expected_nonce {
+                                                    valid = false;
+                                                    break;
+                                                }
                                                 
                                                 // Get balances
-                                                let from_balance = match dirty.get(&from_key).await {
+                                                let from_balance = match dirty.get(&from_balance_key).await {
                                                     Ok(Some(b)) => b,
                                                     Ok(None) => 0,
                                                     Err(_) => {
@@ -500,12 +516,12 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                 }
                                                 
                                                 // Apply transaction
-                                                if dirty.update(from_key, from_balance - tx.amount).await.is_err() {
+                                                if dirty.update(from_balance_key, from_balance - tx.amount).await.is_err() {
                                                     valid = false;
                                                     break;
                                                 }
                                                 
-                                                let to_balance = match dirty.get(&to_key).await {
+                                                let to_balance = match dirty.get(&to_balance_key).await {
                                                     Ok(Some(b)) => b,
                                                     Ok(None) => 0,
                                                     Err(_) => {
@@ -514,7 +530,13 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                     }
                                                 };
                                                 
-                                                if dirty.update(to_key, to_balance + tx.amount).await.is_err() {
+                                                if dirty.update(to_balance_key, to_balance + tx.amount).await.is_err() {
+                                                    valid = false;
+                                                    break;
+                                                }
+                                                
+                                                // Update nonce
+                                                if dirty.update(nonce_key, expected_nonce + 1).await.is_err() {
                                                     valid = false;
                                                     break;
                                                 }
