@@ -9,8 +9,8 @@ use axum::{
 };
 use commonware_consensus::marshal;
 use commonware_cryptography::{
-    ed25519::{PublicKey, Signature},
-    Sha256, sha256::Digest, Hasher, Verifier,
+    ed25519::{PrivateKey, PublicKey, Signature},
+    Sha256, sha256::Digest, Hasher, Signer, Verifier,
 };
 use commonware_codec::{Read, ReadExt, Write, varint::UInt};
 use commonware_runtime::tokio::Context as TokioContext;
@@ -37,6 +37,11 @@ use tracing::{info, warn};
 // Key prefixes for different data types in QMDB
 const KEY_PREFIX_BALANCE: u8 = 0x00;
 const KEY_PREFIX_NONCE: u8 = 0x01;
+const KEY_PREFIX_PUBLIC_KEY: u8 = 0x02;
+const KEY_PREFIX_NEXT_ACCOUNT_ID: u8 = 0x03;
+
+const SYSTEM_ACCOUNT_ID: u64 = 0;
+const SYSTEM_ACCOUNT_SEED: [u8; 32] = [0xFF; 32];
 
 fn balance_key(account_id: u64) -> FixedBytes<8> {
     let mut key = [0u8; 8];
@@ -51,6 +56,14 @@ fn nonce_key(account_id: u64) -> FixedBytes<8> {
     key[0] = KEY_PREFIX_NONCE;
     let account_bytes = account_id.to_be_bytes();
     key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
+
+
+fn next_account_id_key() -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_NEXT_ACCOUNT_ID;
+    key[1..8].fill(0);
     FixedBytes::new(key)
 }
 
@@ -103,6 +116,21 @@ struct SubmitTxRequest {
     nonce: u64,
     signature: String,
     public_key: String,
+    to_public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateAccountRequest {
+    public_key: String,
+    initial_balance: Option<u64>,
+    account_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CreateAccountResponse {
+    account_id: u64,
+    public_key: String,
+    initial_balance: u64,
 }
 
 type Qmdb = Current<TokioContext, FixedBytes<8>, u64, Sha256, TwoCap, 64>;
@@ -133,6 +161,7 @@ pub async fn start_api_server(
     
     let app = Router::new()
         .route("/submit", post(submit_transaction))
+        .route("/accounts/create", post(create_account))
         .route("/mempool", get(get_mempool_status))
         .route("/balance/:account", get(get_balance))
         .route("/balances", get(get_all_balances))
@@ -152,7 +181,15 @@ pub async fn start_api_server(
     Ok(())
 }
 
-fn compute_transaction_hash(from: u64, to: u64, amount: u64, nonce: u64, public_key: &PublicKey) -> Digest {
+fn compute_transaction_hash(
+    from: u64,
+    to: u64,
+    amount: u64,
+    nonce: u64,
+    public_key: &PublicKey,
+    to_public_key: Option<&PublicKey>,
+    is_account_creation: bool,
+) -> Digest {
     let mut hasher = Sha256::new();
     let mut tx_buf = Vec::new();
     UInt(from).write(&mut tx_buf);
@@ -160,6 +197,18 @@ fn compute_transaction_hash(from: u64, to: u64, amount: u64, nonce: u64, public_
     UInt(amount).write(&mut tx_buf);
     UInt(nonce).write(&mut tx_buf);
     public_key.write(&mut tx_buf);
+    
+    // Include to_public_key if present
+    if let Some(ref pk) = to_public_key {
+        tx_buf.push(1);
+        pk.write(&mut tx_buf);
+    } else {
+        tx_buf.push(0);
+    }
+    
+    // Include is_account_creation flag
+    tx_buf.push(if is_account_creation { 1 } else { 0 });
+    
     hasher.update(NAMESPACE);
     hasher.update(&tx_buf);
     hasher.finalize()
@@ -216,6 +265,59 @@ async fn submit_transaction(
     }
     drop(public_keys_guard);
     
+    // Check if receiver account exists and handle to_public_key
+    let receiver_exists = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            let to_balance_key = balance_key(payload.to);
+            qmdb_ref.get(&to_balance_key).await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_some()
+        } else {
+            false
+        }
+    };
+    
+    // Handle to_public_key based on receiver existence
+    let to_public_key = if !receiver_exists {
+        // Receiver doesn't exist - require to_public_key
+        match &payload.to_public_key {
+            Some(pk_hex) => {
+                let pk_bytes = hex::decode(pk_hex)
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                let mut pk_reader = pk_bytes.as_slice();
+                Some(PublicKey::read_cfg(&mut pk_reader, &())
+                    .map_err(|_| StatusCode::BAD_REQUEST)?)
+            }
+            None => {
+                return Ok(Json(SubmitTxResponse {
+                    success: false,
+                    message: format!(
+                        "Receiver account {} doesn't exist. Provide 'to_public_key' to create it automatically.",
+                        payload.to
+                    ),
+                }));
+            }
+        }
+    } else {
+        // Receiver exists - should not provide to_public_key
+        if payload.to_public_key.is_some() {
+            return Ok(Json(SubmitTxResponse {
+                success: false,
+                message: "Receiver account exists. Do not provide 'to_public_key'.".to_string(),
+            }));
+        }
+        None
+    };
+    
+    // Validate account ID if creating
+    if !receiver_exists && payload.to < 10 {
+        return Ok(Json(SubmitTxResponse {
+            success: false,
+            message: "Account IDs 0-9 are reserved for genesis accounts.".to_string(),
+        }));
+    }
+    
     // Verify signature
     let tx_hash = compute_transaction_hash(
         payload.from,
@@ -223,6 +325,8 @@ async fn submit_transaction(
         payload.amount,
         payload.nonce,
         &public_key,
+        to_public_key.as_ref(),
+        false, // is_account_creation
     );
     if !public_key.verify(NAMESPACE, tx_hash.as_ref(), &signature) {
         return Ok(Json(SubmitTxResponse {
@@ -281,6 +385,8 @@ async fn submit_transaction(
         nonce: payload.nonce,
         signature,
         public_key,
+        to_public_key,
+        is_account_creation: false,
     };
     
     let added = state.mempool.add(tx);
@@ -302,6 +408,110 @@ async fn submit_transaction(
             success: false,
             message: "Mempool is full".to_string(),
         }))
+    }
+}
+
+async fn create_account(
+    State(state): State<ApiState>,
+    Json(payload): Json<CreateAccountRequest>,
+) -> Result<Json<CreateAccountResponse>, StatusCode> {
+    // Decode public key
+    let pk_bytes = hex::decode(&payload.public_key)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut pk_reader = pk_bytes.as_slice();
+    let public_key = PublicKey::read_cfg(&mut pk_reader, &())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    
+    // Determine account ID
+    let account_id = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            if let Some(id) = payload.account_id {
+                // User-specified ID
+                if id < 10 {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                
+                // Check if account exists
+                let balance_key = balance_key(id);
+                if qmdb_ref.get(&balance_key).await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .is_some() {
+                    return Err(StatusCode::CONFLICT);
+                }
+                id
+            } else {
+                // System-assigned ID
+                let key = next_account_id_key();
+                let current = qmdb_ref.get(&key).await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .unwrap_or(10);
+                current
+            }
+        } else {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    
+    let initial_balance = payload.initial_balance.unwrap_or(0);
+    
+    // Get system account nonce
+    let system_nonce = {
+        let qmdb_guard = state.qmdb.lock().await;
+        if let Some(qmdb_ref) = qmdb_guard.as_ref() {
+            let nonce_key = nonce_key(SYSTEM_ACCOUNT_ID);
+            qmdb_ref.get(&nonce_key).await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .unwrap_or(0)
+        } else {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    
+    // Sign account creation transaction
+    use commonware_math::algebra::Random;
+    use rand::{rngs::StdRng, SeedableRng};
+    let mut system_rng = StdRng::from_seed(SYSTEM_ACCOUNT_SEED);
+    let system_private_key = PrivateKey::random(&mut system_rng);
+    let system_public_key = system_private_key.public_key();
+    
+    // Create transaction for signing
+    let tx_hash = compute_transaction_hash(
+        SYSTEM_ACCOUNT_ID,
+        account_id,
+        initial_balance,
+        system_nonce,
+        &system_public_key,
+        Some(&public_key),
+        true, // is_account_creation
+    );
+    
+    // Sign
+    let signature = system_private_key.sign(NAMESPACE, tx_hash.as_ref());
+    
+    // Create final transaction
+    let tx = Transaction {
+        from: SYSTEM_ACCOUNT_ID,
+        to: account_id,
+        amount: initial_balance,
+        nonce: system_nonce,
+        signature,
+        public_key: system_public_key,
+        to_public_key: Some(public_key),
+        is_account_creation: true,
+    };
+    
+    // Add to mempool
+    let added = state.mempool.add(tx);
+    
+    if added {
+        Ok(Json(CreateAccountResponse {
+            account_id,
+            public_key: payload.public_key,
+            initial_balance,
+        }))
+    } else {
+        Err(StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 

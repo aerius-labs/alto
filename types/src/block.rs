@@ -16,6 +16,8 @@ pub struct Transaction {
     pub nonce: u64,
     pub signature: Signature,
     pub public_key: PublicKey,
+    pub to_public_key: Option<PublicKey>,
+    pub is_account_creation: bool,
 }
 
 impl Write for Transaction {
@@ -26,6 +28,17 @@ impl Write for Transaction {
         UInt(self.nonce).write(writer);
         self.signature.write(writer);
         self.public_key.write(writer);
+        
+        // Write to_public_key (optional)
+        if let Some(ref pk) = self.to_public_key {
+            writer.put_u8(1);
+            pk.write(writer);
+        } else {
+            writer.put_u8(0);
+        }
+        
+        // Write is_account_creation flag
+        writer.put_u8(if self.is_account_creation { 1 } else { 0 });
     }
 }
 
@@ -39,7 +52,28 @@ impl Read for Transaction {
         let nonce = UInt::read(reader)?.into();
         let signature = Signature::read(reader)?;
         let public_key = PublicKey::read(reader)?;
-        Ok(Self { from, to, amount, nonce, signature, public_key })
+        
+        // Read to_public_key (optional)
+        let flag = u8::read(reader)?;
+        let to_public_key = if flag == 1 {
+            Some(PublicKey::read(reader)?)
+        } else {
+            None
+        };
+        
+        // Read is_account_creation flag
+        let is_account_creation = u8::read(reader)? != 0;
+        
+        Ok(Self {
+            from,
+            to,
+            amount,
+            nonce,
+            signature,
+            public_key,
+            to_public_key,
+            is_account_creation,
+        })
     }
 }
 
@@ -51,6 +85,11 @@ impl EncodeSize for Transaction {
             + UInt(self.nonce).encode_size()
             + self.signature.encode_size()
             + self.public_key.encode_size()
+            + 1  // to_public_key flag
+            + self.to_public_key.as_ref()
+                .map(|pk| pk.encode_size())
+                .unwrap_or(0)
+            + 1  // is_account_creation flag
     }
 }
 

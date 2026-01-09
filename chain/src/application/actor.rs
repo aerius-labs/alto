@@ -26,6 +26,7 @@ use futures::{channel::mpsc, future::try_join};
 use futures::{future, future::Either};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -41,6 +42,12 @@ const GENESIS_BALANCE: u64 = 1000;
 // Key prefixes for different data types in QMDB
 const KEY_PREFIX_BALANCE: u8 = 0x00;
 const KEY_PREFIX_NONCE: u8 = 0x01;
+const KEY_PREFIX_PUBLIC_KEY: u8 = 0x02;
+const KEY_PREFIX_NEXT_ACCOUNT_ID: u8 = 0x03;
+
+// System account constants
+const SYSTEM_ACCOUNT_ID: u64 = 0;
+const SYSTEM_ACCOUNT_SEED: [u8; 32] = [0xFF; 32];
 
 fn balance_key(account_id: u64) -> FixedBytes<8> {
     let mut key = [0u8; 8];
@@ -58,6 +65,40 @@ fn nonce_key(account_id: u64) -> FixedBytes<8> {
     FixedBytes::new(key)
 }
 
+fn public_key_key(account_id: u64) -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_PUBLIC_KEY;
+    let account_bytes = account_id.to_be_bytes();
+    key[1..8].copy_from_slice(&account_bytes[1..8]);
+    FixedBytes::new(key)
+}
+
+fn next_account_id_key() -> FixedBytes<8> {
+    let mut key = [0u8; 8];
+    key[0] = KEY_PREFIX_NEXT_ACCOUNT_ID;
+    key[1..8].fill(0);
+    FixedBytes::new(key)
+}
+
+fn get_system_private_key() -> PrivateKey {
+    use rand::{rngs::StdRng, SeedableRng};
+    let mut rng = StdRng::from_seed(SYSTEM_ACCOUNT_SEED);
+    PrivateKey::random(&mut rng)
+}
+
+fn get_system_public_key() -> PublicKey {
+    get_system_private_key().public_key()
+}
+
+fn hash_public_key(pk: &PublicKey) -> u64 {
+    let mut hasher = Sha256::new();
+    let mut pk_buf = Vec::new();
+    pk.write(&mut pk_buf);
+    hasher.update(&pk_buf);
+    let hash = hasher.finalize();
+    u64::from_be_bytes(hash[0..8].try_into().unwrap())
+}
+
 fn compute_transaction_hash(tx: &Transaction) -> commonware_cryptography::sha256::Digest {
     let mut hasher = Sha256::new();
     let mut tx_buf = Vec::new();
@@ -67,6 +108,18 @@ fn compute_transaction_hash(tx: &Transaction) -> commonware_cryptography::sha256
     UInt(tx.amount).write(&mut tx_buf);
     UInt(tx.nonce).write(&mut tx_buf);
     tx.public_key.write(&mut tx_buf);
+    
+    // Include to_public_key if present
+    if let Some(ref pk) = tx.to_public_key {
+        tx_buf.push(1);
+        pk.write(&mut tx_buf);
+    } else {
+        tx_buf.push(0);
+    }
+    
+    // Include is_account_creation flag
+    tx_buf.push(if tx.is_account_creation { 1 } else { 0 });
+    
     hasher.update(NAMESPACE);
     hasher.update(&tx_buf);
     hasher.finalize()
@@ -123,28 +176,123 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
             qmdb_config.clone(),
         ).await?;
         
-        // Initialize genesis balances and nonces
-        let mut dirty = qmdb.into_dirty();
+        // Check if genesis state already exists
+        let balance_key_0 = balance_key(0);
+        let genesis_exists = {
+            let mut dirty = qmdb.into_dirty();
+            let exists = dirty.get(&balance_key_0).await?.is_some();
+            qmdb = dirty.merkleize().await?;
+            exists
+        };
+        
         let mut genesis_public_keys = HashMap::new();
-        for i in 0u64..10 {
-            use rand::{rngs::StdRng, SeedableRng};
-            let mut seed = [0u8; 32];
-            seed[0..8].copy_from_slice(&i.to_be_bytes());
-            let mut rng = StdRng::from_seed(seed);
-            let private_key = PrivateKey::random(&mut rng);
-            let public_key = private_key.public_key();
-            genesis_public_keys.insert(i, public_key);
+        
+        if !genesis_exists {
+            let mut dirty = qmdb.into_dirty();
+            // Initialize genesis balances and nonces
+            for i in 0u64..10 {
+                use rand::{rngs::StdRng, SeedableRng};
+                let mut seed = [0u8; 32];
+                if i == SYSTEM_ACCOUNT_ID {
+                    seed = SYSTEM_ACCOUNT_SEED;
+                } else {
+                    seed[0..8].copy_from_slice(&i.to_be_bytes());
+                }
+                let mut rng = StdRng::from_seed(seed);
+                let private_key = PrivateKey::random(&mut rng);
+                let public_key = private_key.public_key();
+                genesis_public_keys.insert(i, public_key.clone());
+                
+                let balance_key = balance_key(i);
+                // All genesis accounts get the same balance
+                dirty.update(balance_key, GENESIS_BALANCE).await?;
+                
+                let account_nonce_key = nonce_key(i);
+                dirty.update(account_nonce_key, 0u64).await?;
+                
+                // Store public key hash in QMDB
+                let pk_key = public_key_key(i);
+                let pk_hash = hash_public_key(&public_key);
+                dirty.update(pk_key, pk_hash).await?;
+            }
             
-            let balance_key = balance_key(i);
-            dirty.update(balance_key, GENESIS_BALANCE).await?;
+            // Initialize next_account_id to 10
+            let next_id_key = next_account_id_key();
+            dirty.update(next_id_key, 10u64).await?;
             
-            let nonce_key = nonce_key(i);
-            dirty.update(nonce_key, 0u64).await?;
+            // Verify system account public key matches expected
+            let system_pk = get_system_public_key();
+            if genesis_public_keys.get(&SYSTEM_ACCOUNT_ID) != Some(&system_pk) {
+                warn!("System account public key mismatch - updating to expected key");
+                genesis_public_keys.insert(SYSTEM_ACCOUNT_ID, system_pk);
+            }
+            
+            // Merkleize to get clean state, then commit to persist
+            let mut clean = dirty.merkleize().await?;
+            clean.commit(None).await?;
+            qmdb = clean;
+        } else {
+            // Load existing state - regenerate public keys deterministically from seeds
+            // This ensures consistency with generate_test_tx
+            // We need to update public key hashes in QMDB if they've changed
+            let mut dirty = qmdb.into_dirty();
+            let mut updated_any = false;
+            
+            for i in 0u64..10 {
+                use rand::{rngs::StdRng, SeedableRng};
+                let mut seed = [0u8; 32];
+                if i == SYSTEM_ACCOUNT_ID {
+                    seed = SYSTEM_ACCOUNT_SEED;
+                } else {
+                    seed[0..8].copy_from_slice(&i.to_be_bytes());
+                }
+                let mut rng = StdRng::from_seed(seed);
+                let private_key = PrivateKey::random(&mut rng);
+                let public_key = private_key.public_key();
+                genesis_public_keys.insert(i, public_key.clone());
+                
+                // Update public key hash in QMDB if it exists and might be outdated
+                let pk_key = public_key_key(i);
+                let new_pk_hash = hash_public_key(&public_key);
+                match dirty.get(&pk_key).await {
+                    Ok(Some(old_hash)) => {
+                        if old_hash != new_pk_hash {
+                            // Public key hash changed (e.g., account 0 now uses SYSTEM_ACCOUNT_SEED)
+                            if let Err(e) = dirty.update(pk_key, new_pk_hash).await {
+                                warn!(account_id = i, error = ?e, "Failed to update public key hash in QMDB");
+                            } else {
+                                updated_any = true;
+                                info!(account_id = i, "Updated public key hash in QMDB");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Public key hash doesn't exist, create it
+                        if let Err(e) = dirty.update(pk_key, new_pk_hash).await {
+                            warn!(account_id = i, error = ?e, "Failed to create public key hash in QMDB");
+                        } else {
+                            updated_any = true;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(account_id = i, error = ?e, "Failed to check public key hash in QMDB");
+                    }
+                }
+            }
+            
+            if updated_any {
+                // Commit the public key hash updates
+                let mut clean = dirty.merkleize().await?;
+                clean.commit(None).await?;
+                qmdb = clean;
+                info!("Updated public key hashes in QMDB for existing genesis state");
+            } else {
+                // No updates needed, just convert back to clean
+                qmdb = dirty.merkleize().await?;
+            }
+            
+            info!("Loaded existing genesis state, regenerated public keys deterministically");
         }
-        // Merkleize to get clean state, then commit to persist
-        let mut clean = dirty.merkleize().await?;
-        clean.commit(None).await?;
-        qmdb = clean;
         
         let mempool = Mempool::new(config.mempool_max_size);
         let mempool_clone = mempool.clone();
@@ -476,17 +624,101 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                             let mut valid = true;
                                             
                                             for tx in &transactions {
+                                                // Handle explicit account creation
+                                                if tx.is_account_creation {
+                                                    // Verify account doesn't exist
+                                                    let balance_key = balance_key(tx.to);
+                                                    if dirty.get(&balance_key).await.is_ok_and(|opt| opt.is_some()) {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Verify account ID is valid
+                                                    if tx.to < 10 {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Verify receiver's public key is provided
+                                                    if tx.to_public_key.is_none() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Verify sender is system account
+                                                    if tx.from != SYSTEM_ACCOUNT_ID {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Verify system account nonce
+                                                    let system_nonce_key = nonce_key(SYSTEM_ACCOUNT_ID);
+                                                    let expected_system_nonce = match dirty.get(&system_nonce_key).await {
+                                                        Ok(Some(n)) => n,
+                                                        Ok(None) => 0,
+                                                        Err(_) => {
+                                                            valid = false;
+                                                            break;
+                                                        }
+                                                    };
+                                                    
+                                                    if tx.nonce != expected_system_nonce {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Simulate account creation (must match execution phase exactly)
+                                                    if dirty.update(balance_key, tx.amount).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    if dirty.update(nonce_key(tx.to), 0u64).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Store public key hash in QMDB (must match execution)
+                                                    let pk_key = public_key_key(tx.to);
+                                                    let pk_hash = hash_public_key(tx.to_public_key.as_ref().unwrap());
+                                                    if dirty.update(pk_key, pk_hash).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Update next_account_id to prevent ID collisions (must match execution)
+                                                    let next_id_key = next_account_id_key();
+                                                    let current_next_id = match dirty.get(&next_id_key).await {
+                                                        Ok(Some(id)) => id,
+                                                        Ok(None) => 10,
+                                                        Err(_) => {
+                                                            valid = false;
+                                                            break;
+                                                        }
+                                                    };
+                                                    let new_next_id = current_next_id.max(tx.to + 1);
+                                                    if dirty.update(next_id_key, new_next_id).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Increment system account nonce
+                                                    if dirty.update(system_nonce_key, expected_system_nonce + 1).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    continue;  // Skip normal transfer verification
+                                                }
+                                                
+                                                // Handle regular transfer
                                                 if tx.amount == 0 {
                                                     valid = false;
                                                     break;
                                                 }
                                                 
-                                                let from_balance_key = balance_key(tx.from);
-                                                let to_balance_key = balance_key(tx.to);
-                                                let nonce_key = nonce_key(tx.from);
-                                                
                                                 // Verify nonce
-                                                let expected_nonce = match dirty.get(&nonce_key).await {
+                                                let account_nonce_key = nonce_key(tx.from);
+                                                let expected_nonce = match dirty.get(&account_nonce_key).await {
                                                     Ok(Some(n)) => n,
                                                     Ok(None) => 0,
                                                     Err(_) => {
@@ -498,6 +730,66 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                 if tx.nonce != expected_nonce {
                                                     valid = false;
                                                     break;
+                                                }
+                                                
+                                                let from_balance_key = balance_key(tx.from);
+                                                let to_balance_key = balance_key(tx.to);
+                                                
+                                                // Check if receiver exists
+                                                let receiver_exists = dirty.get(&to_balance_key).await
+                                                    .is_ok_and(|opt| opt.is_some());
+                                                
+                                                // If receiver doesn't exist, require to_public_key
+                                                if !receiver_exists {
+                                                    if tx.to < 10 {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    if tx.to_public_key.is_none() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Simulate account creation (must match execution phase exactly)
+                                                    if dirty.update(balance_key(tx.to), 0u64).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    if dirty.update(nonce_key(tx.to), 0u64).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Store public key hash in QMDB (must match execution)
+                                                    let pk_key = public_key_key(tx.to);
+                                                    let pk_hash = hash_public_key(tx.to_public_key.as_ref().unwrap());
+                                                    if dirty.update(pk_key, pk_hash).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                    
+                                                    // Update next_account_id to prevent ID collisions (must match execution)
+                                                    let next_id_key = next_account_id_key();
+                                                    let current_next_id = match dirty.get(&next_id_key).await {
+                                                        Ok(Some(id)) => id,
+                                                        Ok(None) => 10,
+                                                        Err(_) => {
+                                                            valid = false;
+                                                            break;
+                                                        }
+                                                    };
+                                                    let new_next_id = current_next_id.max(tx.to + 1);
+                                                    if dirty.update(next_id_key, new_next_id).await.is_err() {
+                                                        valid = false;
+                                                        break;
+                                                    }
+                                                } else {
+                                                    // Receiver exists - should not have to_public_key
+                                                    if tx.to_public_key.is_some() {
+                                                        valid = false;
+                                                        break;
+                                                    }
                                                 }
                                                 
                                                 // Get balances
@@ -530,13 +822,13 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                                                     }
                                                 };
                                                 
-                                                if dirty.update(to_balance_key, to_balance + tx.amount).await.is_err() {
+                                                if dirty.update(balance_key(tx.to), to_balance + tx.amount).await.is_err() {
                                                     valid = false;
                                                     break;
                                                 }
                                                 
-                                                // Update nonce
-                                                if dirty.update(nonce_key, expected_nonce + 1).await.is_err() {
+                                                // Increment nonce for next transaction from this account
+                                                if dirty.update(account_nonce_key, expected_nonce + 1).await.is_err() {
                                                     valid = false;
                                                     break;
                                                 }
@@ -971,25 +1263,38 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         return false;
                     }
                     
-                    // Verify public key matches account
-                    match public_keys_guard.get(&tx.from) {
-                        Some(registered_pk) => {
-                            if *registered_pk != tx.public_key {
-                                warn!(
-                                    height = block.height,
-                                    from = tx.from,
-                                    "Transaction public key doesn't match registered public key for account"
-                                );
-                                return false;
-                            }
-                        }
-                        None => {
+                    // For account creation transactions, verify sender is system account
+                    if tx.is_account_creation {
+                        let system_pk = get_system_public_key();
+                        if tx.from != SYSTEM_ACCOUNT_ID || tx.public_key != system_pk {
                             warn!(
                                 height = block.height,
                                 from = tx.from,
-                                "Account doesn't have a registered public key"
+                                "Account creation transaction must be from system account"
                             );
                             return false;
+                        }
+                    } else {
+                        // Verify public key matches account
+                        match public_keys_guard.get(&tx.from) {
+                            Some(registered_pk) => {
+                                if *registered_pk != tx.public_key {
+                                    warn!(
+                                        height = block.height,
+                                        from = tx.from,
+                                        "Transaction public key doesn't match registered public key for account"
+                                    );
+                                    return false;
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    height = block.height,
+                                    from = tx.from,
+                                    "Account doesn't have a registered public key"
+                                );
+                                return false;
+                            }
                         }
                     }
                 }
@@ -1000,14 +1305,127 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 let mut valid = true;
                 
                 for tx in &block.transactions {
+                    // Handle explicit account creation
+                    if tx.is_account_creation {
+                        // Verify account doesn't exist
+                        let balance_key = balance_key(tx.to);
+                        if dirty.get(&balance_key).await.is_ok_and(|opt| opt.is_some()) {
+                            warn!(
+                                height = block.height,
+                                account_id = tx.to,
+                                "Account already exists, cannot create"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Verify account ID is valid
+                        if tx.to < 10 {
+                            warn!(
+                                height = block.height,
+                                account_id = tx.to,
+                                "Account ID reserved for genesis"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Verify receiver's public key is provided
+                        if tx.to_public_key.is_none() {
+                            warn!(
+                                height = block.height,
+                                account_id = tx.to,
+                                "Account creation requires to_public_key"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Verify sender is system account
+                        if tx.from != SYSTEM_ACCOUNT_ID {
+                            warn!(
+                                height = block.height,
+                                from = tx.from,
+                                "Only system account can create accounts explicitly"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Verify system account nonce
+                        let system_nonce_key = nonce_key(SYSTEM_ACCOUNT_ID);
+                        let expected_system_nonce = match dirty.get(&system_nonce_key).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) => 0,
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        };
+                        
+                        if tx.nonce != expected_system_nonce {
+                            warn!(
+                                height = block.height,
+                                expected_nonce = expected_system_nonce,
+                                tx_nonce = tx.nonce,
+                                "System account nonce mismatch"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Simulate account creation (must match proposal and execution phases exactly)
+                        if dirty.update(balance_key, tx.amount).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        if dirty.update(nonce_key(tx.to), 0u64).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Store public key hash in QMDB (must match execution)
+                        let pk_key = public_key_key(tx.to);
+                        let pk_hash = hash_public_key(tx.to_public_key.as_ref().unwrap());
+                        if dirty.update(pk_key, pk_hash).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Update next_account_id to prevent ID collisions (must match execution)
+                        let next_id_key = next_account_id_key();
+                        let current_next_id = match dirty.get(&next_id_key).await {
+                            Ok(Some(id)) => id,
+                            Ok(None) => 10,
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        };
+                        let new_next_id = current_next_id.max(tx.to + 1);
+                        if dirty.update(next_id_key, new_next_id).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Increment system account nonce
+                        if dirty.update(system_nonce_key, expected_system_nonce + 1).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        continue;  // Skip normal transfer verification
+                    }
+                    
+                    // Handle regular transfer
                     if tx.amount == 0 {
                         valid = false;
                         break;
                     }
                     
                     // Verify nonce
-                    let nonce_key = nonce_key(tx.from);
-                    let expected_nonce = match dirty.get(&nonce_key).await {
+                    let account_nonce_key = nonce_key(tx.from);
+                    let expected_nonce = match dirty.get(&account_nonce_key).await {
                         Ok(Some(n)) => n,
                         Ok(None) => 0,
                         Err(_) => {
@@ -1030,6 +1448,78 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     
                     let from_balance_key = balance_key(tx.from);
                     let to_balance_key = balance_key(tx.to);
+                    
+                    // Check if receiver exists
+                    let receiver_exists = dirty.get(&to_balance_key).await
+                        .is_ok_and(|opt| opt.is_some());
+                    
+                    // If receiver doesn't exist, require to_public_key
+                    if !receiver_exists {
+                        if tx.to < 10 {
+                            warn!(
+                                height = block.height,
+                                to = tx.to,
+                                "Cannot auto-create genesis account"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        if tx.to_public_key.is_none() {
+                            warn!(
+                                height = block.height,
+                                to = tx.to,
+                                "Receiver account doesn't exist, to_public_key required"
+                            );
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Simulate account creation (must match proposal and execution phases exactly)
+                        if dirty.update(balance_key(tx.to), 0u64).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        if dirty.update(nonce_key(tx.to), 0u64).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Store public key hash in QMDB (must match execution)
+                        let pk_key = public_key_key(tx.to);
+                        let pk_hash = hash_public_key(tx.to_public_key.as_ref().unwrap());
+                        if dirty.update(pk_key, pk_hash).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                        
+                        // Update next_account_id to prevent ID collisions (must match execution)
+                        let next_id_key = next_account_id_key();
+                        let current_next_id = match dirty.get(&next_id_key).await {
+                            Ok(Some(id)) => id,
+                            Ok(None) => 10,
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        };
+                        let new_next_id = current_next_id.max(tx.to + 1);
+                        if dirty.update(next_id_key, new_next_id).await.is_err() {
+                            valid = false;
+                            break;
+                        }
+                    } else {
+                        // Receiver exists - should not have to_public_key
+                        if tx.to_public_key.is_some() {
+                            warn!(
+                                height = block.height,
+                                to = tx.to,
+                                "Receiver account exists, to_public_key should not be provided"
+                            );
+                            valid = false;
+                            break;
+                        }
+                    }
                     
                     // Get balances
                     let from_balance = match dirty.get(&from_balance_key).await {
@@ -1061,12 +1551,13 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         }
                     };
                     
-                    if dirty.update(to_balance_key, to_balance + tx.amount).await.is_err() {
+                    if dirty.update(balance_key(tx.to), to_balance + tx.amount).await.is_err() {
                         valid = false;
                         break;
                     }
                     
-                    if dirty.update(nonce_key, expected_nonce + 1).await.is_err() {
+                    // Increment nonce for next transaction from this account
+                    if dirty.update(account_nonce_key, expected_nonce + 1).await.is_err() {
                         valid = false;
                         break;
                     }
@@ -1254,13 +1745,136 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
 
         // Apply transactions to dirty state
         let mut dirty = qmdb.into_dirty();
+        let mut public_keys_guard = self.public_keys.lock().await;
 
         for tx in &block.transactions {
+            // Handle explicit account creation
+            if tx.is_account_creation {
+                let account_id = tx.to;
+                
+                // Verify account doesn't exist
+                let balance_key = balance_key(account_id);
+                if dirty.get(&balance_key).await?.is_some() {
+                    warn!(
+                        height = block.height,
+                        account_id,
+                        "Account already exists, cannot create"
+                    );
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(QmdbError::Runtime(commonware_runtime::Error::Closed));
+                }
+                
+                // Verify account ID is valid (>= 10 for non-genesis)
+                if account_id < 10 {
+                    warn!(
+                        height = block.height,
+                        account_id,
+                        "Account ID reserved for genesis accounts"
+                    );
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(QmdbError::Runtime(commonware_runtime::Error::Closed));
+                }
+                
+                // Get receiver's public key
+                let receiver_pk = tx.to_public_key.as_ref().ok_or_else(|| {
+                    warn!(
+                        height = block.height,
+                        account_id,
+                        "Account creation requires to_public_key"
+                    );
+                    QmdbError::Runtime(commonware_runtime::Error::Closed)
+                })?.clone();
+                
+                // Create account state
+                if let Err(e) = dirty.update(balance_key, tx.amount).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                if let Err(e) = dirty.update(nonce_key(account_id), 0u64).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                // Store public key hash in QMDB
+                let pk_key = public_key_key(account_id);
+                let pk_hash = hash_public_key(&receiver_pk);
+                if let Err(e) = dirty.update(pk_key, pk_hash).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                // Update in-memory HashMap
+                public_keys_guard.insert(account_id, receiver_pk);
+                
+                // Increment system account nonce
+                let system_nonce_key = nonce_key(SYSTEM_ACCOUNT_ID);
+                let current_system_nonce = dirty.get(&system_nonce_key).await?.unwrap_or(0);
+                if let Err(e) = dirty.update(system_nonce_key, current_system_nonce + 1).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                // Update next_account_id to prevent ID collisions
+                let next_id_key = next_account_id_key();
+                let current_next_id = dirty.get(&next_id_key).await?.unwrap_or(10);
+                let new_next_id = current_next_id.max(account_id + 1);
+                if let Err(e) = dirty.update(next_id_key, new_next_id).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                info!(
+                    height = block.height,
+                    account_id,
+                    initial_balance = tx.amount,
+                    "Created account via explicit creation transaction"
+                );
+                
+                continue;  // Skip normal transfer logic
+            }
+            
+            // Handle regular transfer
             let from_balance_key = balance_key(tx.from);
             let to_balance_key = balance_key(tx.to);
-            let nonce_key = nonce_key(tx.from);
+            let account_nonce_key = nonce_key(tx.from);
 
-            let current_nonce = match dirty.get(&nonce_key).await {
+            let current_nonce = match dirty.get(&account_nonce_key).await {
                 Ok(Some(n)) => n,
                 Ok(None) => 0,
                 Err(e) => {
@@ -1270,6 +1884,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         error = ?e,
                         "failed to get nonce"
                     );
+                    drop(public_keys_guard);
                     let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                         panic!("failed to merkleize after error: {:?}", e);
                     });
@@ -1278,6 +1893,69 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     return Err(e);
                 }
             };
+
+            // Check if receiver account exists
+            let receiver_exists = dirty.get(&to_balance_key).await?.is_some();
+            
+            // Auto-create account if needed
+            if !receiver_exists {
+                // Verify account ID is valid
+                if tx.to < 10 {
+                    warn!(
+                        height = block.height,
+                        to = tx.to,
+                        "Cannot auto-create genesis account"
+                    );
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(QmdbError::Runtime(commonware_runtime::Error::Closed));
+                }
+                
+                // Require receiver's public key
+                let receiver_pk = tx.to_public_key.as_ref().ok_or_else(|| {
+                    warn!(
+                        height = block.height,
+                        to = tx.to,
+                        "Receiver account doesn't exist, to_public_key required"
+                    );
+                    QmdbError::Runtime(commonware_runtime::Error::Closed)
+                })?.clone();
+                
+                // Create account
+                dirty.update(balance_key(tx.to), 0u64).await?;
+                dirty.update(nonce_key(tx.to), 0u64).await?;
+                
+                // Store public key
+                let pk_key = public_key_key(tx.to);
+                let pk_hash = hash_public_key(&receiver_pk);
+                dirty.update(pk_key, pk_hash).await?;
+                
+                public_keys_guard.insert(tx.to, receiver_pk);
+                
+                // Update next_account_id to prevent ID collisions
+                let next_id_key = next_account_id_key();
+                let current_next_id = dirty.get(&next_id_key).await?.unwrap_or(10);
+                let new_next_id = current_next_id.max(tx.to + 1);
+                if let Err(e) = dirty.update(next_id_key, new_next_id).await {
+                    drop(public_keys_guard);
+                    let clean = dirty.merkleize().await.unwrap_or_else(|e| {
+                        panic!("failed to merkleize after error: {:?}", e);
+                    });
+                    let mut qmdb_guard = self.qmdb.lock().await;
+                    *qmdb_guard = Some(clean);
+                    return Err(e);
+                }
+                
+                info!(
+                    height = block.height,
+                    account_id = tx.to,
+                    "Created account via auto-create on first transfer"
+                );
+            }
 
             let from_balance = match dirty.get(&from_balance_key).await {
                 Ok(Some(balance)) => balance,
@@ -1289,6 +1967,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         error = ?e,
                         "failed to get sender balance"
                     );
+                    drop(public_keys_guard);
                     let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                         panic!("failed to merkleize after error: {:?}", e);
                     });
@@ -1308,6 +1987,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                         error = ?e,
                         "failed to get receiver balance"
                     );
+                    drop(public_keys_guard);
                     let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                         panic!("failed to merkleize after error: {:?}", e);
                     });
@@ -1325,6 +2005,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     amount = tx.amount,
                     "insufficient balance in execute_transactions (should have been caught in verification)"
                 );
+                drop(public_keys_guard);
                 let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
@@ -1342,6 +2023,7 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                     error = ?e,
                     "failed to update sender balance"
                 );
+                drop(public_keys_guard);
                 let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
@@ -1350,13 +2032,14 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 return Err(e);
             }
 
-            if let Err(e) = dirty.update(to_balance_key, to_balance + tx.amount).await {
+            if let Err(e) = dirty.update(balance_key(tx.to), to_balance + tx.amount).await {
                 warn!(
                     height = block.height,
                     to = tx.to,
                     error = ?e,
                     "failed to update receiver balance"
                 );
+                drop(public_keys_guard);
                 let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
@@ -1365,13 +2048,14 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 return Err(e);
             }
             
-            if let Err(e) = dirty.update(nonce_key, current_nonce + 1).await {
+            if let Err(e) = dirty.update(account_nonce_key, current_nonce + 1).await {
                 warn!(
                     height = block.height,
                     from = tx.from,
                     error = ?e,
                     "failed to increment nonce"
                 );
+                drop(public_keys_guard);
                 let clean = dirty.merkleize().await.unwrap_or_else(|e| {
                     panic!("failed to merkleize after error: {:?}", e);
                 });
@@ -1380,6 +2064,8 @@ impl<R: Rng + Spawner + Metrics + Clock + Storage> Actor<R> {
                 return Err(e);
             }
         }
+        
+        drop(public_keys_guard);
 
         let mut clean = match dirty.merkleize().await {
             Ok(clean) => clean,
