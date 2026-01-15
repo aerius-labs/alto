@@ -5,6 +5,9 @@ pub use ingress::Mailbox;
 mod mempool;
 pub use mempool::Mempool;
 
+#[cfg(test)]
+mod tests;
+
 /// Configuration for the application.
 pub struct Config {
     /// Number of messages from consensus to hold in our backlog
